@@ -1,0 +1,23 @@
+[package]
+name = "huskarl-crypto-macos"
+version = "0.1.0"
+edition = "2024"
+description = "macOS Secure Enclave backed ES256 signing for the huskarl (OAuth2 client) ecosystem."
+repository = "https://github.com/huskarl-rs/huskarl-crypto-macos"
+license = "MIT OR Apache-2.0"
+keywords = ["oauth2", "security", "authentication", "macos", "keychain"]
+categories = ["authentication"]
+readme = "README.md"
+
+[dependencies]
+huskarl-core = { version = "0.4", default-features = false }
+p256 = { version = "=0.14.0-rc.9", default-features = false, features = ["ecdsa"] }
+security-framework = { version = "3.6.0", features = ["OSX_10_15"] }
+security-framework-sys = "2.17"
+snafu = { version = "0.9", default-features = false, features = ["std", "rust_1_81"] }
+
+[dev-dependencies]
+base64 = "0.22"
+http = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
