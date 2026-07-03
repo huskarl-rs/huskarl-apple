@@ -25,10 +25,7 @@ async fn main() {
         "Public JWK:\n{}\n",
         serde_json::to_string_pretty(&*jwk).unwrap()
     );
-    println!(
-        "JWK thumbprint: {}\n",
-        jwk.thumbprint().unwrap_or_default()
-    );
+    println!("JWK thumbprint: {}\n", jwk.thumbprint());
 
     println!("JWS algorithm: {}", key.jws_algorithm());
     println!("Key ID: {:?}\n", key.key_id());

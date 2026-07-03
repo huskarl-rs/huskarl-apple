@@ -10,7 +10,8 @@ use std::sync::Arc;
 use huskarl_core::crypto::signer::{
     AsymmetricJwsSigner, AsymmetricJwsSignerSelector, JwsSigner, JwsSignerSelector,
 };
-use huskarl_core::jwk::{EcPublicKey, PublicJwk};
+use huskarl_core::jwk::{EcPublicKey, KeyUse, PublicJwk};
+use huskarl_core::platform::MaybeSendBoxFuture;
 use p256::ecdsa::signature;
 use p256::elliptic_curve::sec1::ToSec1Point as _;
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
@@ -66,9 +67,15 @@ pub enum SigningError {
     },
 }
 
-impl huskarl_core::Error for SigningError {
-    fn is_retryable(&self) -> bool {
-        false
+impl From<SetupError> for huskarl_core::Error {
+    fn from(value: SetupError) -> Self {
+        huskarl_core::Error::new(huskarl_core::RetryAdvice::No, value)
+    }
+}
+
+impl From<SigningError> for huskarl_core::Error {
+    fn from(value: SigningError) -> Self {
+        huskarl_core::Error::new(huskarl_core::RetryAdvice::No, value)
     }
 }
 
@@ -84,9 +91,10 @@ pub struct Es256PrivateKey {
 #[derive(Debug)]
 struct Es256PrivateKeyInner {
     key: SecKey,
+    // `jwk` carries the canonical `kid`, so `key_id()` and the published JWK
+    // can't diverge.
     jwk: PublicJwk,
     thumbprint: String,
-    key_id: Option<String>,
 }
 
 /// Extracts the public key JWK from a Secure Enclave key.
@@ -104,6 +112,8 @@ fn extract_public_jwk(key: &SecKey) -> Result<PublicJwk, SetupError> {
     let point = p256_key.to_sec1_point(false);
 
     Ok(PublicJwk::builder()
+        .algorithm("ES256")
+        .key_use(KeyUse::Sign)
         .key(
             EcPublicKey::builder()
                 .crv("P-256")
@@ -152,14 +162,13 @@ impl Es256PrivateKey {
         })?;
 
         let jwk = extract_public_jwk(&key)?;
-        let thumbprint = jwk.thumbprint().context(PublicKeyExtractionSnafu)?;
+        let thumbprint = jwk.thumbprint();
 
         Ok(Self {
             inner: Arc::new(Es256PrivateKeyInner {
                 key,
                 jwk,
                 thumbprint,
-                key_id: None,
             }),
         })
     }
@@ -186,96 +195,120 @@ impl Es256PrivateKey {
             .context(KeyNotFoundSnafu)?;
 
         let jwk = extract_public_jwk(&key)?;
-        let thumbprint = jwk.thumbprint().context(PublicKeyExtractionSnafu)?;
+        let thumbprint = jwk.thumbprint();
 
         Ok(Self {
             inner: Arc::new(Es256PrivateKeyInner {
                 key,
                 jwk,
                 thumbprint,
-                key_id: None,
             }),
         })
     }
 
     /// Set the key ID for this key.
     ///
-    /// The key ID is used in the JWT `kid` header parameter.
+    /// The key ID is used in the JWT `kid` header parameter and carried in
+    /// the public JWK.
     #[must_use]
     pub fn with_key_id(self, key_id: impl Into<String>) -> Self {
+        let mut jwk = self.inner.jwk.clone();
+        jwk.kid = Some(key_id.into());
         Self {
             inner: Arc::new(Es256PrivateKeyInner {
                 key: self.inner.key.clone(),
-                jwk: self.inner.jwk.clone(),
+                jwk,
                 thumbprint: self.inner.thumbprint.clone(),
-                key_id: Some(key_id.into()),
             }),
         }
     }
 }
 
-impl JwsSignerSelector for Es256PrivateKey {
-    type Signer = Self;
-
-    fn select_signer(&self) -> Self::Signer {
-        self.clone()
-    }
-}
-
-impl JwsSigner for Es256PrivateKey {
-    type Error = SigningError;
-
+// The signer traits are implemented on the shared inner so the selectors can
+// hand out the existing `Arc` (a refcount bump, no allocation).
+impl JwsSigner for Es256PrivateKeyInner {
     fn jws_algorithm(&self) -> Cow<'_, str> {
         Cow::Borrowed("ES256")
     }
 
     fn key_id(&self) -> Option<Cow<'_, str>> {
-        self.inner.key_id.as_deref().map(Cow::Borrowed)
+        self.jwk.kid.as_deref().map(Cow::Borrowed)
     }
 
-    async fn sign(&self, input: &[u8]) -> Result<Vec<u8>, Self::Error> {
-        let der_signature = self
-            .inner
-            .key
-            .create_signature(
-                security_framework::key::Algorithm::ECDSASignatureMessageX962SHA256,
-                input,
-            )
-            .map_err(|e| {
-                SigningSnafu {
-                    message: e.to_string(),
-                }
-                .build()
-            })?;
+    fn sign<'a>(
+        &'a self,
+        input: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, huskarl_core::Error>> {
+        Box::pin(async move {
+            let der_signature = self
+                .key
+                .create_signature(
+                    security_framework::key::Algorithm::ECDSASignatureMessageX962SHA256,
+                    input,
+                )
+                .map_err(|e| {
+                    SigningSnafu {
+                        message: e.to_string(),
+                    }
+                    .build()
+                })?;
 
-        let signature = p256::ecdsa::Signature::from_der(&der_signature)
-            .context(SignatureConversionSnafu)?;
+            let signature = p256::ecdsa::Signature::from_der(&der_signature)
+                .context(SignatureConversionSnafu)?;
 
-        Ok(signature.to_bytes().to_vec())
+            Ok(signature.to_bytes().to_vec())
+        })
+    }
+}
+
+impl AsymmetricJwsSigner for Es256PrivateKeyInner {
+    fn public_key_jwk(&self) -> Cow<'_, PublicJwk> {
+        Cow::Borrowed(&self.jwk)
+    }
+}
+
+impl JwsSigner for Es256PrivateKey {
+    fn jws_algorithm(&self) -> Cow<'_, str> {
+        self.inner.jws_algorithm()
+    }
+
+    fn key_id(&self) -> Option<Cow<'_, str>> {
+        self.inner.key_id()
+    }
+
+    fn sign<'a>(
+        &'a self,
+        input: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, huskarl_core::Error>> {
+        self.inner.sign(input)
     }
 }
 
 impl AsymmetricJwsSigner for Es256PrivateKey {
     fn public_key_jwk(&self) -> Cow<'_, PublicJwk> {
-        Cow::Borrowed(&self.inner.jwk)
+        self.inner.public_key_jwk()
+    }
+}
+
+impl JwsSignerSelector for Es256PrivateKey {
+    fn select_signer(&self) -> MaybeSendBoxFuture<'_, Arc<dyn JwsSigner>> {
+        let signer: Arc<dyn JwsSigner> = self.inner.clone();
+        Box::pin(async move { signer })
     }
 }
 
 impl AsymmetricJwsSignerSelector for Es256PrivateKey {
-    type AsymmetricSigner = Self;
-
-    fn select_asymmetric_signer(&self) -> Self::AsymmetricSigner {
-        self.clone()
+    fn select_asymmetric_signer(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AsymmetricJwsSigner>> {
+        let signer: Arc<dyn AsymmetricJwsSigner> = self.inner.clone();
+        Box::pin(async move { signer })
     }
 
-    fn select_asymmetric_signer_by_thumbprint(
-        &self,
-        thumbprint: &str,
-    ) -> Option<Self::AsymmetricSigner> {
-        if self.inner.thumbprint == thumbprint {
-            Some(self.clone())
-        } else {
-            None
-        }
+    fn select_signer_by_thumbprint<'a>(
+        &'a self,
+        thumbprint: &'a str,
+    ) -> MaybeSendBoxFuture<'a, Option<Arc<dyn AsymmetricJwsSigner>>> {
+        let signer: Arc<dyn AsymmetricJwsSigner> = self.inner.clone();
+        let matches = self.inner.thumbprint == thumbprint;
+        Box::pin(async move { matches.then_some(signer) })
     }
 }

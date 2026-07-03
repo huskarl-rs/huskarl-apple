@@ -10,8 +10,8 @@ categories = ["authentication"]
 readme = "README.md"
 
 [dependencies]
-huskarl-core = { version = "0.4", default-features = false }
-p256 = { version = "=0.14.0-rc.9", default-features = false, features = ["ecdsa"] }
+huskarl-core = { version = "0.10", default-features = false }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 security-framework = { version = "3.6.0", features = ["OSX_10_15"] }
 security-framework-sys = "2.17"
 snafu = { version = "0.9", default-features = false, features = ["std", "rust_1_81"] }
