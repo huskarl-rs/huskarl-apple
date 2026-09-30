@@ -1,0 +1,17 @@
+[package]
+name = "huskarl-apple-example"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+huskarl-apple = { path = "../../.." }
+huskarl = { version = "0.11", default-features = false }
+huskarl-core = { version = "0.10", default-features = false }
+futures-lite = "2"
+snafu = "0.9"

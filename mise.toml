@@ -1,0 +1,33 @@
+[tasks."test:signed"]
+description = "Build, provision, sign, and run macOS integration tests"
+usage = '''
+arg "[tests]" var=#true help="Defaults to lifecycle, storage, and concurrent creation" {
+  choices "keychain_lifecycle" "keychain_storage" "load_or_generate" "access_groups" "user_presence"
+}
+'''
+run = "python3 scripts/signed-tests.py {{ usage.tests | join(sep=' ') }}"
+
+[tasks."test:cleanup"]
+description = "Preview leftover enclave test keys; use --delete to remove them"
+usage = 'flag "--delete" help="Delete the matching test keys"'
+run = "python3 scripts/signed-tests.py --cleanup {% if usage.delete %}--delete{% endif %}"
+
+[tasks."example:ios"]
+description = "Build and launch the iOS simulator refresh-token example"
+usage = '''
+flag "--build-only" help="Build without launching a simulator"
+flag "--verify" help="Check persistence across separate app launches (clears the example token)"
+'''
+run = "python3 scripts/apple-example.py {% if usage.build_only %}--build-only{% endif %} {% if usage.verify %}--verify{% endif %}"
+
+[tasks."example:macos"]
+description = "Build and launch the signed macOS refresh-token example"
+usage = '''
+flag "--build-only" help="Build without launching the app"
+flag "--verify" help="Check persistence across separate app launches (clears the example token)"
+'''
+run = "python3 scripts/apple-example.py --macos {% if usage.build_only %}--build-only{% endif %} {% if usage.verify %}--verify{% endif %}"
+
+[tasks."docs:readme"]
+description = "Regenerate README from crate documentation"
+run = "cargo +nightly reedme"

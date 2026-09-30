@@ -1,0 +1,19 @@
+[env]
+HUSKARL_SIGNING_IDENTITY = "Apple Development: Your Name (YOURTEAMID)"
+HUSKARL_PROVISIONING_PROFILE = "/absolute/path/to/Huskarl.provisionprofile"
+
+# Optional: required only if the profile's application identifier is a wildcard.
+# HUSKARL_BUNDLE_ID = "io.example.HuskarlHarness"
+
+# Optional: defaults to the profile-authorized application identifier.
+# HUSKARL_TEST_ACCESS_GROUP = "APPIDPREFIX.io.example.HuskarlHarness"
+
+# Required only for the access_groups test; both must be authorized by the profile.
+# HUSKARL_TEST_ACCESS_GROUP_A = "APPIDPREFIX.io.example.HuskarlHarness"
+# HUSKARL_TEST_ACCESS_GROUP_B = "APPIDPREFIX.io.example.HuskarlHarness.secondary"
+
+# test:cleanup also searches groups A/B when configured. Reserve these groups
+# for tests; run cleanup only after signed tests have stopped.
+
+# Optional simulator selection for mise run example:ios (from simctl list devices).
+# HUSKARL_IOS_SIMULATOR = "YOUR-SIMULATOR-UDID"
