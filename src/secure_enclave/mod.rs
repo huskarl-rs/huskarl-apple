@@ -17,7 +17,7 @@ use core_foundation::{
 pub use policy::KeyAccessPolicy;
 pub use seal::{SealingError, SealingKey};
 use security_framework::{
-    item::{ItemSearchOptions, KeyClass, Location, Reference, SearchResult},
+    item::{ItemClass, ItemSearchOptions, KeyClass, Location, Reference, SearchResult},
     key::{GenerateKeyOptions, KeyType, SecKey, Token},
 };
 use security_framework_sys::base::errSecItemNotFound;
@@ -123,7 +123,13 @@ fn generate_key(
     purpose: KeyPurpose,
     policy: KeyAccessPolicy,
     access_group: Option<&str>,
+    #[cfg(feature = "local-authentication")] authentication_context: Option<
+        &crate::authentication::AuthenticationContext,
+    >,
 ) -> Result<SecKey, SetupError> {
+    #[cfg(feature = "local-authentication")]
+    let _operation =
+        authentication_context.map(crate::authentication::AuthenticationContext::operation);
     let access = policy.access_control()?;
     let mut options = GenerateKeyOptions::default();
     options
@@ -133,7 +139,14 @@ fn generate_key(
         .set_location(Location::DataProtectionKeychain)
         .set_token(Token::SecureEnclave)
         .set_access_control(access);
-    generate_tagged_key(&options, purpose, access_group).context(KeyGenerationSnafu)
+    generate_tagged_key(
+        &options,
+        purpose,
+        access_group,
+        #[cfg(feature = "local-authentication")]
+        authentication_context,
+    )
+    .context(KeyGenerationSnafu)
 }
 
 // security-framework does not expose generation setters for application tag
@@ -144,6 +157,9 @@ fn generation_attributes(
     options: &GenerateKeyOptions,
     purpose: KeyPurpose,
     access_group: Option<&str>,
+    #[cfg(feature = "local-authentication")] authentication_context: Option<
+        &crate::authentication::AuthenticationContext,
+    >,
 ) -> CFDictionary {
     let original = options.to_dictionary();
     let (keys, values) = original.get_keys_and_values();
@@ -160,6 +176,10 @@ fn generation_attributes(
         let group = CFString::new(group);
         attributes.set(name.to_void(), group.to_void());
     }
+    #[cfg(feature = "local-authentication")]
+    if let Some(context) = authentication_context {
+        context.apply_attributes(&mut attributes);
+    }
     attributes.to_immutable()
 }
 
@@ -168,8 +188,17 @@ fn generate_tagged_key(
     options: &GenerateKeyOptions,
     purpose: KeyPurpose,
     access_group: Option<&str>,
+    #[cfg(feature = "local-authentication")] authentication_context: Option<
+        &crate::authentication::AuthenticationContext,
+    >,
 ) -> Result<SecKey, CFError> {
-    SecKey::generate(generation_attributes(options, purpose, access_group))
+    SecKey::generate(generation_attributes(
+        options,
+        purpose,
+        access_group,
+        #[cfg(feature = "local-authentication")]
+        authentication_context,
+    ))
 }
 
 fn key_query(label: &str, purpose: KeyPurpose, access_group: Option<&str>) -> ItemSearchOptions {
@@ -189,18 +218,31 @@ fn load_key(
     label: &str,
     purpose: KeyPurpose,
     access_group: Option<&str>,
+    #[cfg(feature = "local-authentication")] authentication_context: Option<
+        &crate::authentication::AuthenticationContext,
+    >,
 ) -> Result<SecKey, SetupError> {
-    let result = key_query(label, purpose, access_group)
-        .load_refs(true)
-        .limit(2)
-        .search();
+    #[cfg(feature = "local-authentication")]
+    let _operation =
+        authentication_context.map(crate::authentication::AuthenticationContext::operation);
+    let mut query = key_query(label, purpose, access_group);
+    #[cfg(feature = "local-authentication")]
+    if let Some(context) = authentication_context {
+        context.apply_query(&mut query);
+    }
+    let result = query.load_refs(true).limit(2).search();
     let key = key_from_search(result)?;
     validate_token(&key)?;
     // SecKeyCopyAttributes does not promise application tags. Read persisted
     // Keychain metadata instead, pinning the query to this exact public-key
     // identity to avoid validating metadata for a replacement key.
     let identity = key.application_label().context(PublicKeyExtractionSnafu)?;
-    let metadata = key_query(label, purpose, access_group)
+    let mut query = key_query(label, purpose, access_group);
+    #[cfg(feature = "local-authentication")]
+    if let Some(context) = authentication_context {
+        context.apply_query(&mut query);
+    }
+    let metadata = query
         .application_label(&identity)
         .load_attributes(true)
         .limit(2)
@@ -258,18 +300,75 @@ fn validate_token(key: &SecKey) -> Result<(), SetupError> {
     Ok(())
 }
 
-fn delete_key(key: &SecKey, access_group: Option<&str>) -> Result<(), SetupError> {
-    let identity = key.application_label().context(PublicKeyExtractionSnafu)?;
+// Generation persists the public key as its own item with the same
+// application label, so deleting the private key alone leaves it behind.
+// TLS client certificates installed for the key are removed too, since no
+// identity can form from them once the key is gone.
+fn delete_key(
+    identity: &[u8],
+    access_group: Option<&str>,
+    #[cfg(feature = "local-authentication")] authentication_context: Option<
+        &crate::authentication::AuthenticationContext,
+    >,
+) -> Result<(), SetupError> {
+    // A previous attempt may already have deleted the private half. Continue
+    // cleanup using the identity captured when the key was loaded or created.
+    #[cfg(feature = "local-authentication")]
+    let _operation =
+        authentication_context.map(crate::authentication::AuthenticationContext::operation);
+    #[allow(unused_mut)]
+    let mut private = key_pair_query(KeyClass::private(), identity, access_group);
+    #[cfg(feature = "local-authentication")]
+    if let Some(context) = authentication_context {
+        context.apply_query(&mut private);
+    }
+    ignore_missing(private.delete())?;
+    // Absent for keys generated elsewhere that never stored a public item.
+    ignore_missing(key_pair_query(KeyClass::public(), identity, access_group).delete())?;
+    let mut certificates = ItemSearchOptions::new();
+    #[cfg(target_os = "macos")]
+    certificates.ignore_legacy_keychains();
+    certificates
+        .class(ItemClass::certificate())
+        .label(&tls_certificate_label(identity));
+    if let Some(group) = access_group {
+        certificates.access_group(group);
+    }
+    ignore_missing(certificates.delete())
+}
+
+fn ignore_missing(result: Result<(), security_framework::base::Error>) -> Result<(), SetupError> {
+    match result {
+        Err(error) if error.code() == errSecItemNotFound => Ok(()),
+        result => result.context(KeyDeletionSnafu),
+    }
+}
+
+/// The Keychain label shared by every TLS client certificate installed for
+/// the key with this application label (its public-key hash).
+pub(crate) fn tls_certificate_label(key_hash: &[u8]) -> String {
+    use std::fmt::Write as _;
+    key_hash
+        .iter()
+        .fold(String::from("huskarl-apple/tls/"), |mut label, byte| {
+            let _ = write!(label, "{byte:02x}");
+            label
+        })
+}
+
+fn key_pair_query(
+    class: KeyClass,
+    identity: &[u8],
+    access_group: Option<&str>,
+) -> ItemSearchOptions {
     let mut query = ItemSearchOptions::new();
     #[cfg(target_os = "macos")]
     query.ignore_legacy_keychains();
-    query
-        .key_class(KeyClass::private())
-        .application_label(&identity);
+    query.key_class(class).application_label(identity);
     if let Some(group) = access_group {
         query.access_group(group);
     }
-    query.delete().context(KeyDeletionSnafu)
+    query
 }
 
 #[cfg(test)]
@@ -306,10 +405,24 @@ mod tests {
     #[test]
     fn purpose_tag_is_required_and_checked() {
         let options = GenerateKeyOptions::default();
-        let signing =
-            || SearchResult::Dict(generation_attributes(&options, KeyPurpose::Signing, None));
-        let sealing =
-            || SearchResult::Dict(generation_attributes(&options, KeyPurpose::Sealing, None));
+        let signing = || {
+            SearchResult::Dict(generation_attributes(
+                &options,
+                KeyPurpose::Signing,
+                None,
+                #[cfg(feature = "local-authentication")]
+                None,
+            ))
+        };
+        let sealing = || {
+            SearchResult::Dict(generation_attributes(
+                &options,
+                KeyPurpose::Sealing,
+                None,
+                #[cfg(feature = "local-authentication")]
+                None,
+            ))
+        };
         assert!(validate_purpose_metadata(&[signing()], KeyPurpose::Signing).is_ok());
         assert!(validate_purpose_metadata(&[sealing()], KeyPurpose::Sealing).is_ok());
         assert!(matches!(
@@ -345,7 +458,13 @@ mod tests {
             .set_location(Location::DataProtectionKeychain)
             .set_token(Token::SecureEnclave)
             .set_access_control(KeyAccessPolicy::default().access_control().unwrap());
-        let dict = generation_attributes(&options, KeyPurpose::Signing, Some("TEAM.group"));
+        let dict = generation_attributes(
+            &options,
+            KeyPurpose::Signing,
+            Some("TEAM.group"),
+            #[cfg(feature = "local-authentication")]
+            None,
+        );
         let attrs = SearchResult::Dict(dict.clone()).simplify_dict().unwrap();
         assert_eq!(attrs.get("agrp").map(String::as_str), Some("TEAM.group"));
         assert_eq!(
@@ -362,10 +481,15 @@ mod tests {
         );
         // Ensure the private-key access-control subdictionary survived copying.
         assert!(dict.contains_key(&CFString::new("private").to_void()));
-        let default_group =
-            SearchResult::Dict(generation_attributes(&options, KeyPurpose::Signing, None))
-                .simplify_dict()
-                .unwrap();
+        let default_group = SearchResult::Dict(generation_attributes(
+            &options,
+            KeyPurpose::Signing,
+            None,
+            #[cfg(feature = "local-authentication")]
+            None,
+        ))
+        .simplify_dict()
+        .unwrap();
         assert!(!default_group.contains_key("agrp"));
     }
 

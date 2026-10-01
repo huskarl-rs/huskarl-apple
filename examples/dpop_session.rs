@@ -16,7 +16,7 @@ use huskarl::{
 };
 use huskarl_apple::{
     Es256PrivateKey,
-    keychain::{KeychainRefreshTokenStore, KeychainSecretStore, SecretAccessPolicy},
+    keychain::{DataProtectionKeychain, KeychainRefreshTokenStore, SecretAccessPolicy},
     policy::Authentication,
 };
 use huskarl_core::{
@@ -74,8 +74,8 @@ async fn main() -> Result<(), AppError> {
         return Err("RESOURCE_URL must be an HTTPS URL".into());
     }
     let access_group = std::env::var("HUSKARL_ACCESS_GROUP")?;
-    // Reserve a distinct account and directory for each issuer/client/user session.
-    let account = std::env::var("HUSKARL_ACCOUNT")?;
+    // Choose a stable local session ID and a matching directory for its ownership locks.
+    let session_id = std::env::var("HUSKARL_SESSION_ID")?;
     let state_dir = PathBuf::from(std::env::var("HUSKARL_STATE_DIR")?);
     let scope: Vec<String> = std::env::var("SCOPE")?
         .split_whitespace()
@@ -93,30 +93,25 @@ async fn main() -> Result<(), AppError> {
         .open(state_dir.join("session.lock"))?;
     session_lock.try_lock()?; // Refuse a second rotation owner rather than waiting.
 
-    let disk = KeychainRefreshTokenStore::builder()
-        .storage(
-            KeychainSecretStore::builder()
-                .service("io.example.huskarl.dpop-session")
-                .account(&account)
-                .access_group(&access_group)
-                .access_policy(
-                    SecretAccessPolicy::builder()
-                        .authentication(Authentication::UserPresence)
-                        .build(),
-                )
-                .build(),
-        )
-        .build();
+    let disk = KeychainRefreshTokenStore::new(
+        DataProtectionKeychain::new(&access_group)?
+            .secret("io.example.huskarl.dpop-session", &session_id)?
+            .store()
+            .creation_policy(
+                SecretAccessPolicy::builder()
+                    .authentication(Authentication::UserPresence)
+                    .build(),
+            )
+            .build(),
+    );
     // Authenticate when restoring the session. Access failures are propagated.
     let restored = disk.get().await?;
-    let key = blocking::unblock(move || {
-        Es256PrivateKey::load_or_generate()
-            .label(&format!("io.example.huskarl.dpop-session/{account}"))
-            .access_group(access_group)
-            .lock_path(&state_dir.join("key.lock"))
-            .call() // Default policy: device-only, unlocked, no presence on signing.
-    })
-    .await?;
+    let key = Es256PrivateKey::load_or_generate()
+        .label(&format!("io.example.huskarl.dpop-session/{session_id}"))
+        .access_group(access_group)
+        .lock_path(&state_dir.join("key.lock"))
+        .load_or_generate()
+        .await?; // Device-only, unlocked, no presence on signing.
     let thumbprint = key.public_key_jwk().thumbprint();
     let memory = InMemoryRefreshTokenStore::default();
     if let Some(token) = restored {

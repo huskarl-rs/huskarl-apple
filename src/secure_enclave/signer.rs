@@ -50,6 +50,9 @@ impl From<SigningError> for huskarl_core::Error {
 ///
 /// The private key never leaves the hardware and cannot be extracted.
 /// Signing is performed by the Secure Enclave via the Security framework.
+///
+/// Keychain setup and deletion run on a blocking pool. Dropping their futures
+/// does not cancel work already running; it may still create or delete items.
 #[derive(Debug, Clone)]
 pub struct Es256PrivateKey {
     inner: Arc<Es256PrivateKeyInner>,
@@ -58,7 +61,10 @@ pub struct Es256PrivateKey {
 #[derive(Debug)]
 struct Es256PrivateKeyInner {
     key: SecKey,
+    application_label: Vec<u8>,
     access_group: Option<String>,
+    #[cfg(feature = "local-authentication")]
+    authentication_context: Option<crate::authentication::AuthenticationContext>,
     // `jwk` carries the canonical `kid`, so `key_id()` and the published JWK
     // can't diverge.
     jwk: PublicJwk,
@@ -74,19 +80,33 @@ impl Es256PrivateKey {
     ///
     /// # Errors
     /// Returns an error if policy creation, key generation, or extraction fails.
-    #[builder(start_fn = generate_with, finish_fn = generate)]
-    pub fn generate_configured(
+    #[builder(finish_fn = generate)]
+    pub async fn generate_with(
         label: &str,
-        #[builder(default)] access_policy: KeyAccessPolicy,
+        #[builder(default)] creation_policy: KeyAccessPolicy,
         #[builder(into)] access_group: Option<String>,
+        /// Shared context used for setup and subsequent private-key operations.
+        #[cfg(feature = "local-authentication")]
+        authentication_context: Option<crate::authentication::AuthenticationContext>,
     ) -> Result<Self, SetupError> {
-        let key = generate_key(
-            label,
-            KeyPurpose::Signing,
-            access_policy,
-            access_group.as_deref(),
-        )?;
-        Self::from_key(key, access_group)
+        let label = label.to_owned();
+        blocking::unblock(move || {
+            let key = generate_key(
+                &label,
+                KeyPurpose::Signing,
+                creation_policy,
+                access_group.as_deref(),
+                #[cfg(feature = "local-authentication")]
+                authentication_context.as_ref(),
+            )?;
+            Self::from_key(
+                key,
+                access_group,
+                #[cfg(feature = "local-authentication")]
+                authentication_context,
+            )
+        })
+        .await
     }
 
     /// Generate a new ES256 key in the Secure Enclave.
@@ -99,8 +119,8 @@ impl Es256PrivateKey {
     ///
     /// Returns an error if the key could not be generated or the public
     /// key could not be extracted.
-    pub fn generate(label: &str) -> Result<Self, SetupError> {
-        Self::generate_with().label(label).generate()
+    pub async fn generate(label: &str) -> Result<Self, SetupError> {
+        Self::generate_with().label(label).generate().await
     }
 
     /// Load an existing ES256 key from the Secure Enclave by label.
@@ -110,8 +130,8 @@ impl Es256PrivateKey {
     /// # Errors
     ///
     /// Returns an error if the key is not found or could not be loaded.
-    pub fn load(label: &str) -> Result<Self, SetupError> {
-        Self::load_with().label(label).load()
+    pub async fn load(label: &str) -> Result<Self, SetupError> {
+        Self::load_with().label(label).load().await
     }
 
     /// Load from an optional entitled access group.
@@ -121,13 +141,31 @@ impl Es256PrivateKey {
     ///
     /// # Errors
     /// Returns an error for missing, ambiguous, incorrectly tagged, or inaccessible keys.
-    #[builder(start_fn = load_with, finish_fn = load)]
-    pub fn load_configured(
+    #[builder(finish_fn = load)]
+    pub async fn load_with(
         label: &str,
         #[builder(into)] access_group: Option<String>,
+        /// Shared context used for setup and subsequent private-key operations.
+        #[cfg(feature = "local-authentication")]
+        authentication_context: Option<crate::authentication::AuthenticationContext>,
     ) -> Result<Self, SetupError> {
-        let key = load_key(label, KeyPurpose::Signing, access_group.as_deref())?;
-        Self::from_key(key, access_group)
+        let label = label.to_owned();
+        blocking::unblock(move || {
+            let key = load_key(
+                &label,
+                KeyPurpose::Signing,
+                access_group.as_deref(),
+                #[cfg(feature = "local-authentication")]
+                authentication_context.as_ref(),
+            )?;
+            Self::from_key(
+                key,
+                access_group,
+                #[cfg(feature = "local-authentication")]
+                authentication_context,
+            )
+        })
+        .await
     }
 
     /// Load an existing key, or generate only after a definite not-found result.
@@ -137,32 +175,54 @@ impl Es256PrivateKey {
     /// The parent directory must exist. Never remove or replace the lock file
     /// while callers may use it. The file contains no key material.
     ///
-    /// This synchronous operation waits for an exclusive OS lock. The lock is
-    /// released on return or process exit. Direct `generate` calls and external
-    /// writers do not participate; do not race them against this operation.
-    /// Existing keys retain their policy; `access_policy` applies only to creation.
+    /// The blocking worker waits for an exclusive OS lock. The lock is
+    /// released when the worker finishes or the process exits. Direct `generate`
+    /// calls and external writers do not participate; do not race them against this operation.
+    /// Existing keys retain their policy; `creation_policy` applies only to creation.
     ///
     /// # Errors
     /// Returns lock, lookup, validation, generation, or extraction errors.
     /// Authorization failures and malformed results never trigger creation.
-    #[builder(finish_fn = call)]
-    pub fn load_or_generate(
+    #[builder(finish_fn = load_or_generate)]
+    pub async fn load_or_generate(
         label: &str,
         #[builder(into)] access_group: String,
         lock_path: &std::path::Path,
-        #[builder(default)] access_policy: KeyAccessPolicy,
+        #[builder(default)] creation_policy: KeyAccessPolicy,
+        /// Shared context used for setup and subsequent private-key operations.
+        #[cfg(feature = "local-authentication")]
+        authentication_context: Option<crate::authentication::AuthenticationContext>,
     ) -> Result<Self, SetupError> {
-        let key = super::provision::load_or_generate(
-            label,
-            KeyPurpose::Signing,
-            &access_group,
-            access_policy,
-            lock_path,
-        )?;
-        Self::from_key(key, Some(access_group))
+        let label = label.to_owned();
+        let lock_path = lock_path.to_owned();
+        blocking::unblock(move || {
+            let key = super::provision::load_or_generate(
+                &label,
+                KeyPurpose::Signing,
+                &access_group,
+                creation_policy,
+                &lock_path,
+                #[cfg(feature = "local-authentication")]
+                authentication_context.as_ref(),
+            )?;
+            Self::from_key(
+                key,
+                Some(access_group),
+                #[cfg(feature = "local-authentication")]
+                authentication_context,
+            )
+        })
+        .await
     }
 
-    fn from_key(key: SecKey, access_group: Option<String>) -> Result<Self, SetupError> {
+    fn from_key(
+        key: SecKey,
+        access_group: Option<String>,
+        #[cfg(feature = "local-authentication")] authentication_context: Option<
+            crate::authentication::AuthenticationContext,
+        >,
+    ) -> Result<Self, SetupError> {
+        let application_label = key.application_label().context(PublicKeyExtractionSnafu)?;
         let public = key.public_key().context(PublicKeyExtractionSnafu)?;
         let mut jwk = super::public_key::extract(&public)?;
         jwk.algorithm = Some("ES256".into());
@@ -172,7 +232,10 @@ impl Es256PrivateKey {
         Ok(Self {
             inner: Arc::new(Es256PrivateKeyInner {
                 key,
+                application_label,
                 access_group,
+                #[cfg(feature = "local-authentication")]
+                authentication_context,
                 jwk,
                 thumbprint,
             }),
@@ -187,12 +250,25 @@ impl Es256PrivateKey {
         VerifyingKey::from_key(&self.inner.key, self.inner.jwk.kid.clone())
     }
 
-    /// Delete this exact persisted key. All clones refer to the same key.
+    /// Delete this persisted key, its public half, and associated client certificates.
+    /// All clones refer to the same key; this is not local handle cleanup.
+    ///
+    /// Repeated calls resume cleanup after partial deletion and succeed when
+    /// all of these items are already absent.
     ///
     /// # Errors
     /// Returns an error if Keychain deletion fails.
-    pub fn delete(&self) -> Result<(), SetupError> {
-        super::delete_key(&self.inner.key, self.inner.access_group.as_deref())
+    pub async fn delete_key_and_associated_items(&self) -> Result<(), SetupError> {
+        let key = self.clone();
+        blocking::unblock(move || {
+            super::delete_key(
+                &key.inner.application_label,
+                key.inner.access_group.as_deref(),
+                #[cfg(feature = "local-authentication")]
+                key.inner.authentication_context.as_ref(),
+            )
+        })
+        .await
     }
 
     /// Set the key ID for this key.
@@ -206,11 +282,95 @@ impl Es256PrivateKey {
         Self {
             inner: Arc::new(Es256PrivateKeyInner {
                 key: self.inner.key.clone(),
+                application_label: self.inner.application_label.clone(),
                 access_group: self.inner.access_group.clone(),
+                #[cfg(feature = "local-authentication")]
+                authentication_context: self.inner.authentication_context.clone(),
                 jwk,
                 thumbprint: self.inner.thumbprint.clone(),
             }),
         }
+    }
+}
+
+#[cfg(feature = "urlsession")]
+#[bon::bon]
+impl Es256PrivateKey {
+    /// Install an X.509 certificate for this key and return a TLS client identity.
+    ///
+    /// Stores the certificate in the data protection Keychain, in this key's
+    /// access group, and returns the identity the Keychain forms from the
+    /// pair. The certificate must certify this key's public key and should
+    /// permit client authentication. Pass the result to
+    /// [`UrlSessionClient`](crate::urlsession::UrlSessionClient) for mTLS.
+    /// Reinstalling the same certificate is harmless. Failed installation
+    /// attempts leave previously installed certificates intact.
+    /// An existing duplicate must have this library's label for this key;
+    /// certificates stored under another label are rejected without modification.
+    ///
+    /// Installation runs on a blocking pool. Dropping the future does not
+    /// cancel an installation already running.
+    ///
+    /// Certificates remain in the Keychain after this key or the returned
+    /// identity is dropped; [`Self::delete_key_and_associated_items`] removes them
+    /// with the key. Use
+    /// [`ClientIdentity::remove_certificates`](crate::urlsession::ClientIdentity::remove_certificates)
+    /// to remove them while keeping the key.
+    /// Use [`Self::install_client_identity_with`] when the server needs intermediate
+    /// certificates to build the client certificate chain.
+    ///
+    /// # Errors
+    /// Returns an error if the certificate is malformed, does not match this
+    /// key, or cannot be stored.
+    pub async fn install_client_identity(
+        &self,
+        certificate_der: &[u8],
+    ) -> Result<crate::urlsession::ClientIdentity, crate::urlsession::ClientIdentityError> {
+        self.install_client_identity_with()
+            .certificate_der(certificate_der)
+            .install()
+            .await
+    }
+
+    /// Install a TLS client identity with optional intermediate certificates.
+    ///
+    /// Runs on a blocking pool with the same cancellation behavior as
+    /// [`Self::install_client_identity`].
+    /// The leaf certificate is stored as described by [`Self::install_client_identity`].
+    /// Intermediates are held in memory and sent with the identity during TLS
+    /// authentication. They are neither installed in the Keychain nor added to
+    /// the client's server trust anchors.
+    ///
+    /// Certificates are parsed before any Keychain write. Supply a chain in
+    /// issuer order; this method does not build or validate the chain. The
+    /// server decides whether to trust it.
+    ///
+    /// # Errors
+    /// Returns an error if any certificate is malformed, the leaf does not
+    /// match this key, or Keychain installation fails. Malformed intermediate
+    /// errors include the zero-based index in the supplied list.
+    #[builder(finish_fn = install)]
+    pub async fn install_client_identity_with(
+        &self,
+        /// DER-encoded leaf certificate for this key.
+        certificate_der: &[u8],
+        /// DER-encoded intermediates, starting with the leaf's issuer and
+        /// proceeding toward the root. Exclude the leaf and root. Defaults
+        /// to an empty chain.
+        #[builder(default, into)]
+        intermediates: Vec<Vec<u8>>,
+    ) -> Result<crate::urlsession::ClientIdentity, crate::urlsession::ClientIdentityError> {
+        let key = self.clone();
+        let certificate_der = certificate_der.to_owned();
+        blocking::unblock(move || {
+            crate::urlsession::install_identity(
+                &key.inner.key,
+                key.inner.access_group.as_deref(),
+                &certificate_der,
+                intermediates,
+            )
+        })
+        .await
     }
 }
 
@@ -230,9 +390,15 @@ impl JwsSigner for Es256PrivateKeyInner {
         input: &'a [u8],
     ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, huskarl_core::Error>> {
         let key = self.key.clone();
+        #[cfg(feature = "local-authentication")]
+        let authentication_context = self.authentication_context.clone();
         let input = input.to_vec();
         Box::pin(async move {
             blocking::unblock(move || {
+                #[cfg(feature = "local-authentication")]
+                let _operation = authentication_context
+                    .as_ref()
+                    .map(crate::authentication::AuthenticationContext::operation);
                 let der_signature = key
                     .create_signature(
                         security_framework::key::Algorithm::ECDSASignatureMessageX962SHA256,
@@ -311,7 +477,13 @@ mod tests {
     fn software_key() -> Es256PrivateKey {
         let mut options = GenerateKeyOptions::default();
         options.set_key_type(KeyType::ec()).set_size_in_bits(256);
-        Es256PrivateKey::from_key(SecKey::new(&options).unwrap(), None).unwrap()
+        Es256PrivateKey::from_key(
+            SecKey::new(&options).unwrap(),
+            None,
+            #[cfg(feature = "local-authentication")]
+            None,
+        )
+        .unwrap()
     }
 
     #[tokio::test]

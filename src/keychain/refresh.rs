@@ -1,4 +1,3 @@
-use bon::Builder;
 use huskarl::{cache::RefreshTokenStore, token::RefreshToken};
 use huskarl_core::{platform::MaybeSendBoxFuture, secrets::SecretBytes};
 use snafu::prelude::*;
@@ -54,10 +53,18 @@ impl From<RefreshTokenStoreError> for huskarl_core::Error {
 /// This store provides no cross-process refresh coordination. Follow huskarl's
 /// single-owner guidance for rotation-only public clients; concurrent writes
 /// are last-writer-wins. Keep a DPoP-bound token's enclave key across restarts.
-#[derive(Debug, Clone, Builder)]
+#[derive(Debug, Clone)]
 pub struct KeychainRefreshTokenStore {
     /// The exact Keychain item and creation policy to use.
     storage: KeychainSecretStore,
+}
+
+impl KeychainRefreshTokenStore {
+    /// Store refresh tokens in this exact, already configured Keychain item.
+    #[must_use]
+    pub fn new(storage: KeychainSecretStore) -> Self {
+        Self { storage }
+    }
 }
 
 fn encode(token: &RefreshToken) -> Result<SecretBytes, RefreshTokenStoreError> {

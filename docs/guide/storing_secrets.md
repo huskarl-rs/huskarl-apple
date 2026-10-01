@@ -4,18 +4,17 @@
 Data protection requires an explicit entitled access group so mutations cannot
 affect the same service/account in another group. File-backed storage requires
 no access group and scopes every operation to the selected keychain. It also
-implements `Secret`, and its `reader()?` returns a `KeychainSecret` for composition
+implements `Secret`, and its `reader()` returns a `KeychainSecret` for composition
 with existing loaders.
 
 ```rust,no_run
 use huskarl_core::secrets::SecretBytes;
-use huskarl_apple::keychain::KeychainSecretStore;
+use huskarl_apple::keychain::DataProtectionKeychain;
 
 # async fn example() -> Result<(), huskarl_apple::keychain::SecretError> {
-let storage = KeychainSecretStore::builder()
-    .service("io.example.credentials")
-    .account("client-secret")
-    .access_group("TEAMID.io.example.shared")
+let storage = DataProtectionKeychain::new("TEAMID.io.example.shared")?
+    .secret("io.example.credentials", "client-secret")?
+    .store()
     .build();
 storage.set(&SecretBytes::new(b"secret-value".to_vec())).await?;
 let value = storage.get().await?;
@@ -27,7 +26,7 @@ storage.clear().await?;
 New data protection items default to device-only access while unlocked, without additional
 human authentication. `SecretAccessPolicy::builder()` accepts the same
 `policy::Availability` and `policy::Authentication` enums as enclave policies. Pass it
-through `.access_policy(...)` when constructing the store. Generic-password
+through `.creation_policy(...)` when constructing the store. Generic-password
 policies omit the enclave-specific private-key-usage constraint. They use
 Apple's [device-only accessibility](https://developer.apple.com/documentation/security/ksecattraccessiblewhenunlockedthisdeviceonly)
 and do not synchronize with iCloud.

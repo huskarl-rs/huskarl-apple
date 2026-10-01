@@ -1,7 +1,7 @@
 //! Integer-only C bridge for the Apple example; no secret crosses the FFI boundary.
 use huskarl::{cache::RefreshTokenStore as _, token::RefreshToken};
+use huskarl_apple::keychain::{DataProtectionKeychain, KeychainRefreshTokenStore};
 use huskarl_core::secrets::SecretString;
-use huskarl_apple::keychain::{KeychainRefreshTokenStore, KeychainSecretStore};
 use snafu::{ResultExt as _, Snafu};
 
 #[derive(Debug, Snafu)]
@@ -15,14 +15,15 @@ enum Error {
 }
 
 async fn operation(action: i32) -> Result<i32, Error> {
-    let storage = KeychainSecretStore::builder()
-        .service(env!("HUSKARL_EXAMPLE_SERVICE"))
-        .account("disposable-refresh-token")
-        .access_group(env!("HUSKARL_EXAMPLE_ACCESS_GROUP"))
+    let storage = DataProtectionKeychain::new(env!("HUSKARL_EXAMPLE_ACCESS_GROUP"))
+        .map_err(huskarl_core::Error::from)
+        .context(StorageSnafu)?
+        .secret(env!("HUSKARL_EXAMPLE_SERVICE"), "disposable-refresh-token")
+        .map_err(huskarl_core::Error::from)
+        .context(StorageSnafu)?
+        .store()
         .build();
-    let tokens = KeychainRefreshTokenStore::builder()
-        .storage(storage)
-        .build();
+    let tokens = KeychainRefreshTokenStore::new(storage);
     let example = RefreshToken::new(SecretString::new("disposable-simulator-token"), None);
     match action {
         0 => match tokens.get().await.context(StorageSnafu)? {

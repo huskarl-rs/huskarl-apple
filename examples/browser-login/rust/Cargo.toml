@@ -1,0 +1,17 @@
+[package]
+name = "huskarl-browser-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+huskarl-apple = { path = "../../..", features = ["web-authentication", "urlsession"] }
+huskarl = { version = "0.11", default-features = false }
+huskarl-core = { version = "0.10", default-features = false }
+objc2 = "0.6"
+tokio = { version = "1", features = ["rt", "time"] }

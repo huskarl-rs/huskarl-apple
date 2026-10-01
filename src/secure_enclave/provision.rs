@@ -12,11 +12,31 @@ pub(super) fn load_or_generate(
     access_group: &str,
     policy: KeyAccessPolicy,
     lock_path: &Path,
+    #[cfg(feature = "local-authentication")] authentication_context: Option<
+        &crate::authentication::AuthenticationContext,
+    >,
 ) -> Result<SecKey, SetupError> {
     coordinated(lock_path, || {
         load_or_create(
-            || load_key(label, purpose, Some(access_group)),
-            || generate_key(label, purpose, policy, Some(access_group)),
+            || {
+                load_key(
+                    label,
+                    purpose,
+                    Some(access_group),
+                    #[cfg(feature = "local-authentication")]
+                    authentication_context,
+                )
+            },
+            || {
+                generate_key(
+                    label,
+                    purpose,
+                    policy,
+                    Some(access_group),
+                    #[cfg(feature = "local-authentication")]
+                    authentication_context,
+                )
+            },
         )
     })
 }

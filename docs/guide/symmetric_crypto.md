@@ -6,13 +6,12 @@ containing 32 raw key bytes:
 ```rust,no_run
 use huskarl_core::{jwk::OctBytes, secrets::Secret};
 use huskarl_crypto_native::aead::AesGcmKey;
-use huskarl_apple::keychain::KeychainSecret;
+use huskarl_apple::keychain::{SecretReadMode, DataProtectionKeychain};
 
 # async fn example() -> Result<(), huskarl_core::Error> {
-let source = KeychainSecret::builder()
-    .service("io.example.crypto")
-    .account("aes-v1")
-    .build();
+let source = DataProtectionKeychain::search_all_groups(
+    "io.example.crypto", "aes-v1", SecretReadMode::Allow,
+)?;
 let cipher = AesGcmKey::from_secret(source.mapped(OctBytes::new("A256GCM"))).await?;
 # Ok(())
 # }

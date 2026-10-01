@@ -1,23 +1,22 @@
 # Persist refresh tokens
 
-For the complete grant-to-request flow, see
-[the persisted `DPoP` session guide](crate::_docs::guide::dpop_session).
+For the complete grant-to-request flow, follow
+[the native browser session guide](crate::_docs::guide::native_session) or
+[the device-authorization session guide](crate::_docs::guide::dpop_session).
 
 For OAuth, use `KeychainRefreshTokenStore` with huskarl's `RefreshTokenStore` trait:
 
 ```rust,no_run
 use huskarl::{cache::RefreshTokenStore, token::RefreshToken};
 use huskarl_core::secrets::SecretString;
-use huskarl_apple::keychain::{KeychainRefreshTokenStore, KeychainSecretStore};
+use huskarl_apple::keychain::{DataProtectionKeychain, KeychainRefreshTokenStore};
 
 # async fn example() -> Result<(), huskarl_core::Error> {
-let tokens = KeychainRefreshTokenStore::builder()
-    .storage(KeychainSecretStore::builder()
-        .service("io.example.oauth.refresh-tokens")
-        .account("issuer-client-user")
-        .access_group("TEAMID.io.example.shared")
-        .build())
+let storage = DataProtectionKeychain::new("TEAMID.io.example.shared")?
+    .secret("io.example.oauth.refresh-tokens", "issuer-client-user")?
+    .store()
     .build();
+let tokens = KeychainRefreshTokenStore::new(storage);
 let token = RefreshToken::new(SecretString::new("refresh-token"), None);
 tokens.set(&token).await?;
 let restored = tokens.get().await?;
@@ -38,7 +37,7 @@ use huskarl_apple::{
 let policy = SecretAccessPolicy::builder()
     .authentication(Authentication::UserPresence)
     .build();
-// Pass .access_policy(policy) to the storage builder above.
+// Pass .creation_policy(policy) to the storage builder above.
 ```
 
 Keep the `DPoP` signing key at `Authentication::None`: protecting that key with
@@ -68,4 +67,3 @@ one additional update if another writer wins, but concurrent writes are
 last-writer-wins. This is not a cross-process refresh lock: follow huskarl's
 single-owner requirement for rotation-only public clients to avoid races during
 refresh-token rotation.
-

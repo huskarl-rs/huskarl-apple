@@ -1,0 +1,22 @@
+[package]
+name = "huskarl-native-session"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+huskarl-apple = { path = "../../..", features = ["web-authentication", "urlsession"] }
+huskarl = { version = "0.11", default-features = false }
+huskarl-core = { version = "0.10", default-features = false }
+bytes = "1"
+http = "1"
+objc2 = "0.6"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+url = "2"

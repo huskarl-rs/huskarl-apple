@@ -8,7 +8,7 @@ by a provisioning profile. Signing a bare Cargo executable with an entitlements
 file does not supply that authorization: package it in an app-like bundle and
 embed the matching profile before signing.
 
-Secrets and refresh tokens can instead use `KeychainBackend::Login`,
+Secrets and refresh tokens can instead use `FileKeychain::login()`,
 `DefaultFile`, or `File(path)` without provisioning. Those backends retain the
 file keychain's ACLs and lock settings; they do not enable Secure Enclave keys.
 See [selecting a backend](crate::_docs::guide::selecting_a_backend).

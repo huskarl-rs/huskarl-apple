@@ -15,13 +15,14 @@ Reads allow authentication UI by default, but unattended callers can explicitly
 exclude protected items:
 
 ```rust,no_run
-use huskarl_apple::keychain::{KeychainSecret, SecretInteraction};
+use huskarl_apple::keychain::{SecretReadMode, DataProtectionKeychain};
 
-let source = KeychainSecret::builder()
-    .service("io.example.oauth")
-    .account("client-secret")
-    .interaction(SecretInteraction::SkipProtectedItems)
-    .build();
+# fn example() -> Result<(), huskarl_apple::keychain::SecretError> {
+let source = DataProtectionKeychain::new("TEAMID.io.example.shared")?
+    .secret("io.example.oauth", "client-secret")?
+    .reader_with(SecretReadMode::SkipProtectedItems);
+# Ok(())
+# }
 ```
 
 ## Notes

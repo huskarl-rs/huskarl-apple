@@ -13,9 +13,129 @@ cargo clippy --all-targets -- -D warnings
 cargo doc --no-deps
 ```
 
+To include the optional URLSession client and its local HTTP/TLS tests, add
+`--features urlsession` to these commands. The URLSession tests need permission
+to open loopback sockets. The Secure Enclave mTLS test uses the signed workflow
+below.
+
+To include the native browser adapter, use `--features web-authentication`, or
+`--all-features` to test all optional adapters. Its automated tests cover URL validation,
+callback matching, native errors, and completion/cancellation ordering.
+
+With `--features local-authentication`, unit tests also check native context
+identity, configuration sharing and invalidation. Compile-fail doctests check that
+unsupported backend options and read-mode combinations are unavailable.
+Run `mise run test:signed authentication_context` for noninteractive, signed
+Keychain and enclave checks (including protected operations with UI disabled).
+Run `mise run test:signed user_presence` to also check authenticated context reuse
+and invalidation with system prompts. The signed runner enables this feature.
+
+CI runs tests, doctests, and documentation builds with default features, each
+optional adapter independently, and all features together, on both Rust 1.92.0
+and stable. Stable also runs Clippy and checks iOS device and simulator library
+builds for every feature configuration. Persisted-item, hardware, and interactive
+browser checks remain opt-in through the workflows below.
+
+CI also tests and lints the standalone native-session Rust bridge and compiles
+its Swift app as an ad-hoc bundle. See the
+[native session example](https://github.com/huskarl-rs/huskarl-apple/tree/main/examples/native-session)
+for the signed browser-login, restart, API request, and logout walkthrough.
+
+For a ready-to-run macOS browser check with disposable Keycloak, run
+`mise run test:browser`; see `examples/browser-login/README.md`.
+
+For other app configurations, integrate the [browser login example](crate::_docs::guide::browser_login)
+into a foreground app and use a registered OAuth client. Check successful login,
+user cancellation, dropping a pending session, and the ephemeral preference.
+Test HTTPS callbacks with a configured associated domain and verify a custom
+scheme on older supported OS versions. These require app/provider setup and
+are not exercised by the unit suite.
+
 Unit tests use ephemeral software keys for Apple's signature and ECIES APIs.
 They may require execution outside an OS sandbox. Integration tests that create
 persisted items or prompt for authentication are opt-in.
+
+## Run native adapter tests on iOS
+
+With an iOS simulator runtime installed in Xcode, run:
+
+```sh
+mise run test:ios
+```
+
+This runs the HTTP/error-handling, TLS trust, and browser-adapter unit tests
+inside the simulator. Browser-adapter unit tests do not present a login UI. Set `HUSKARL_IOS_SIMULATOR` to a simulator UDID to select one; otherwise
+the task prefers a booted simulator. Secure Enclave tests remain ignored here.
+
+For the hardware tests, connect and unlock an iPhone. On the **iPhone**, enable
+Settings → Privacy & Security → Developer Mode, restart, and confirm the setting.
+On the **Mac**, add your Apple developer account in Xcode → Settings → Accounts.
+Then run:
+
+```sh
+mise run test:ios-device
+```
+
+The task builds the Rust mTLS tests and generates an Xcode project under
+`target/ios-device-tests/HuskarlTests.xcodeproj`. Xcode uses automatic signing
+to register the test app/device and create an iOS development profile; no manual
+profile download is needed. It installs the app and checks the device's console
+for both Secure Enclave tests passing. The tests use an HTTPS server on the
+phone itself, and clean up their disposable keys and certificates on success.
+
+The team defaults to the team in `HUSKARL_PROVISIONING_PROFILE`, if configured.
+Otherwise set `HUSKARL_IOS_TEAM`. Use `HUSKARL_IOS_DEVICE` to choose a device when
+multiple phones are connected, and `HUSKARL_IOS_BUNDLE_ID` to override the generated
+test bundle identifier. If automatic signing needs account setup, open the
+generated project in Xcode and select your team under Signing & Capabilities.
+If Xcode reports `PLA Update available`, the team's Account Holder must review
+and accept the pending agreement at [Apple Developer](https://developer.apple.com/account/)
+before provisioning can proceed.
+
+## Test against a real OAuth server
+
+With Docker running and the macOS signing configuration below in place:
+
+```sh
+mise run test:oauth
+```
+
+This starts a disposable Keycloak 26.5.3 container on a random loopback HTTPS
+port. The test realm uses X.509 client authentication and certificate-bound
+access tokens. A temporary root and intermediate CA certify a Secure Enclave
+key's public key; its private key stays in the enclave.
+
+The test checks that Keycloak rejects an anonymous token request, then obtains
+a token through Huskarl's client-credentials grant and checks its `cnf.x5t#S256`
+claim against the client certificate. A small HTTPS resource server validates
+the token using Keycloak introspection, checks its issuer and audience, and
+compares the token's certificate binding with the TLS peer certificate.
+
+The matching certificate gets access. The same token with another valid
+certificate or no certificate gets rejected, as does an invalid token. Tokens
+are not printed. The resource server is a test fixture, not a production server;
+this test covers service authentication, not an interactive user-login flow.
+
+The task stops the container and removes its temporary CA material afterward.
+It requires no existing realm, admin account, or production credentials. The
+container image remains in Docker's cache.
+
+To run the complete OAuth/resource test from the iPhone, use the device signing
+setup above and put the phone on the same Wi-Fi as the Mac:
+
+```sh
+# Replace this with your Mac's LAN IPv4 address (for example, from ipconfig getifaddr en0).
+mise run test:oauth-ios 192.168.1.170
+```
+
+This binds the temporary servers to the specified LAN address instead of
+loopback. Allow Local Network access when the test app asks. The generated app
+under `target/ios-oauth-tests` uses a UIKit scene to handle that permission before
+running Rust tests. It creates the client keys in the **iPhone's** Secure Enclave.
+For this disposable test only, the app carries the intermediate CA's signing key
+so it can certify its newly generated public keys. Real enrollment would obtain
+those certificates from a CA without putting a CA private key on the device.
+The task uninstalls the OAuth test app and removes the copied fixtures afterward.
 
 ## Run signed tests with mise
 
@@ -67,6 +187,9 @@ mise run test:signed access_groups
 
 # Requires a person to respond to authentication prompts:
 mise run test:signed user_presence
+
+# Verifies Secure Enclave mTLS, intermediate chains, and installation rollback:
+mise run test:signed urlsession_mtls
 ```
 
 Run `mise run test:signed --help` for task usage. Without mise, export the
@@ -93,19 +216,21 @@ only private Secure Enclave keys with matching `huskarl-apple/sign` or
 `huskarl-apple/seal` purpose tags and the integration tests' generated label
 formats. Preview prints the group, purpose, and label; it does not read private
 key material. Deletion reloads each candidate through the crate to revalidate
-its purpose and enclave provenance before deleting it.
+its purpose and enclave provenance before deleting both halves of the key pair.
+The helper also selects leftover public halves by their test-label format;
+these public items have no purpose tag or enclave token attribute.
 
 Stop signed tests before cleanup: an active test's keys also match these naming
 rules. Reserve those label formats for this repository's tests, and prefer a
 dedicated test access group. This helper does not delete secrets, refresh tokens,
-example keys, untagged keys, or arbitrary application keys. It cannot discover
-items in groups absent from the current signing configuration. No key-listing
-API is added to the library.
+example keys, untagged private keys, certificates, or arbitrary application keys.
+It cannot discover items in groups absent from the current signing configuration.
+No key-listing API is added to the library.
 
 ## Development without signing
 
 For secret and refresh-token persistence without Keychain entitlements, select
-`KeychainBackend::Login`. To exercise file-backend storage and isolation in two
+`FileKeychain::login()`. To exercise file-backend storage and isolation in two
 disposable keychains, run `cargo test --test file_keychain -- --ignored`.
 This test creates and deletes its temporary keychains, and macOS may prompt for
 authorization. It does not use your login keychain or change the default keychain.
@@ -125,6 +250,7 @@ never do this.
 | `load_or_generate` | `HUSKARL_TEST_ACCESS_GROUP` | Concurrent enclave provisioning returns the same key |
 | `access_groups` | `HUSKARL_TEST_ACCESS_GROUP_A` and `_B` | Key and secret isolation across two distinct entitled groups |
 | `user_presence` | Interactive user session; add `--nocapture` | Signing/unsealing with human authentication |
+| `urlsession_mtls` | `urlsession` feature; enabled by the signed test task | Secure Enclave mTLS, intermediate chains, validation before storage, and installation rollback |
 
 ## Bundled integration tests
 
@@ -162,6 +288,7 @@ codesign --verify --strict --verbose=2 "$huskarl_app"
 ```
 
 Choose the executable and configuration from the [test matrix](#integration-test-executables).
+For `urlsession_mtls`, also pass `--features urlsession` to `cargo rustc`.
 
 For a single-group test, set the actual group claimed by the signed executable
 before running the bundled harness:
@@ -217,6 +344,9 @@ mise run docs:readme
 ```
 
 Tutorials and guides are included through the documentation-only `_docs` module.
-Their Rust examples are checked by ordinary `cargo test --doc`.
+Their Rust examples are checked by `cargo test --doc`; use
+`cargo test --all-features --doc` to include the optional browser, networking,
+and local-authentication examples. Build the complete reference with
+`cargo doc --all-features --no-deps --open`.
 
 [mise-local]: https://mise.jdx.dev/configuration.html#mise-toml

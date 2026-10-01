@@ -1,4 +1,10 @@
-# Make authenticated requests with a persisted `DPoP` session
+# Make authenticated requests with a persisted device-authorization `DPoP` session
+
+This guide uses device authorization: the user visits a verification URL and
+enters a code. For a foreground application presenting Apple's browser, follow
+[the native session guide](crate::_docs::guide::native_session), which combines
+PKCE browser login, persisted enclave/Keychain credentials, API requests, restart
+restoration, and logout in one AppKit UI.
 
 This guide connects the Apple adapters to a complete OAuth client:
 
@@ -39,15 +45,16 @@ huskarl-core = { version = "0.10", default-features = false }
 huskarl-reqwest = { version = "0.9", features = ["rustls-tls"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 http = "1"
-blocking = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
 ## Configure and run the signed example
 
 In the repository root, in the shell used for the signing guide, configure your
-issuer, registered client, and a final HTTPS resource URL. Use a service account
-identifier that distinguishes the issuer, client, and user. Reserve a separate
+issuer, registered client, and a final HTTPS resource URL. Choose a stable local
+saved-session label for `HUSKARL_SESSION_ID`; this is the Keychain item's account
+identifier, not a provider service account or login username. You can choose a
+label such as `example-api-primary` before knowing who will sign in. Reserve a separate
 private state directory for this session, and keep using it across launches.
 All processes using this same token item must use that same directory.
 
@@ -57,8 +64,8 @@ export CLIENT_ID='your-registered-public-client'
 export RESOURCE_URL='https://api.example.com/v1/profile'
 export SCOPE='read offline_access' # Replace with your provider's actual scopes.
 export HUSKARL_ACCESS_GROUP='APPIDPREFIX.io.example.HuskarlHarness'
-export HUSKARL_ACCOUNT='issuer-client-user'
-export HUSKARL_STATE_DIR="$HOME/Library/Application Support/HuskarlDpopExample/issuer-client-user"
+export HUSKARL_SESSION_ID='example-api-primary'
+export HUSKARL_STATE_DIR="$HOME/Library/Application Support/HuskarlDpopExample/$HUSKARL_SESSION_ID"
 mkdir -p "$HUSKARL_STATE_DIR"
 chmod 700 "$HUSKARL_STATE_DIR"
 
@@ -69,6 +76,12 @@ huskarl_package
 codesign --verify --strict --verbose=2 "$huskarl_app"
 "$huskarl_app/Contents/MacOS/huskarl-harness"
 ```
+
+Keep the same label and directory across launches to restore the session.
+Choose different labels and directories for different issuers, clients, or user
+sessions. Changing the label selects a different token item and enclave key;
+it does not delete the previous session. All processes using one saved session
+must share the same directory and lock protocol.
 
 `offline_access` is a common convention, not a promise that a particular server
 will issue a refresh token. The program rejects an initial response without a
@@ -91,7 +104,7 @@ without another device authorization flow while the refresh token remains valid.
    key-provisioning lock coordinates enclave key creation. Keep both lock files;
    do not delete or replace them while any caller may use them.
 2. **Restore credentials.** Load the refresh token from Keychain and load or
-   generate the enclave key on a blocking worker. Key lookup authorization
+   generate the enclave key through its async provisioning API. Key lookup authorization
    failures propagate; only definite absence allows key creation.
 3. **Check the binding.** Compare the stored token's `dpop_jkt()` with the key's
    public JWK thumbprint. A mismatch means the old session is unusable: clear

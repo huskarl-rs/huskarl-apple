@@ -1,11 +1,16 @@
 #![doc = include_str!("keychain/README.md")]
 
 mod backend;
+mod configuration;
 mod refresh;
 mod storage;
 
-pub use backend::KeychainBackend;
-use bon::Builder;
+#[cfg(target_os = "macos")]
+pub use backend::FileKeychain;
+#[cfg(target_os = "macos")]
+pub use configuration::FileSecret;
+pub use configuration::{DataProtectionKeychain, DataProtectionSecret, SecretReadMode};
+use configuration::{ItemIdentifiers, ReadScope, ReadTarget};
 use huskarl_core::{
     platform::MaybeSendBoxFuture,
     secrets::{Secret, SecretBytes, SecretOutput},
@@ -16,34 +21,14 @@ use security_framework_sys::base::errSecItemNotFound;
 use snafu::prelude::*;
 pub use storage::{KeychainSecretStore, SecretAccessPolicy};
 
-/// Whether secret lookups may request user authentication.
-///
-/// This controls a read query, not the persisted item's access policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SecretInteraction {
-    /// Allow macOS to prompt if the stored item's policy requires it (default).
-    ///
-    /// The operation can wait for the user. This does not request an unlock
-    /// timeout or guarantee a fresh prompt on each read.
-    #[default]
-    Allow,
-    /// Exclude items requiring authentication instead of presenting UI.
-    ///
-    /// Uses `kSecUseAuthenticationUISkip`. If no eligible item remains, the
-    /// provider returns [`SecretError::NotFoundWithoutInteraction`]. This does
-    /// not bypass protection or distinguish an absent item from a skipped one.
-    SkipProtectedItems,
-}
-
 /// Failures while accessing or modifying a Keychain secret.
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum SecretError {
-    /// Empty item identifiers or options incompatible with the selected backend.
+    /// Invalid identifiers, file paths, or operation inputs.
     #[snafu(display("invalid Keychain configuration: {reason}"))]
     Configuration {
-        /// The incompatible option, without secret values.
+        /// The invalid input, without secret values.
         reason: &'static str,
     },
     /// Could not resolve or open the selected file-based keychain.
@@ -105,106 +90,82 @@ impl From<SecretError> for huskarl_core::Error {
     }
 }
 
-/// A generic-password item addressed by service, account, and optional group.
+/// A read provider for a validated generic-password identity or explicit search.
 ///
-/// The default data protection backend requires signing and entitlements.
-/// On macOS, select `KeychainBackend::Login` for file-backed storage without provisioning.
+/// Create through [`DataProtectionSecret::reader`],
+/// [`DataProtectionKeychain::search_all_groups`], or a file-backed item reader.
 /// Retrieved bytes enter application memory in zeroizing [`SecretBytes`].
-/// Service and account must be nonempty; invalid identifiers are rejected on read.
-///
-/// Availability and user-presence requirements belong to the stored item and
-/// must be set when provisioning it. A reader cannot change those requirements.
-/// Reading defaults to allowing macOS authentication UI; choose
-/// [`SecretInteraction::SkipProtectedItems`] for unattended data protection reads. Values already
-/// returned to the application are not revoked when the Keychain later locks.
+/// The stored item's policy determines its protection; a reader cannot change it.
+/// Dropping a future does not cancel an in-progress Keychain operation.
 ///
 /// ```no_run
-/// use huskarl_apple::keychain::KeychainSecret;
+/// use huskarl_apple::keychain::DataProtectionKeychain;
 /// use huskarl_core::secrets::{Secret, encodings::StringEncoding};
 ///
 /// # async fn example() -> Result<(), huskarl_core::Error> {
-/// let source = KeychainSecret::builder()
-///     .service("io.example.oauth")
-///     .account("client-secret")
-///     .build();
+/// let source = DataProtectionKeychain::new("TEAM.io.example.app")?
+///     .secret("io.example.oauth", "client-secret")?
+///     .reader();
 /// let secret = source.mapped(StringEncoding).get_secret_value().await?;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, Builder)]
+#[derive(Debug, Clone)]
 pub struct KeychainSecret {
-    /// The item's service identifier.
-    #[builder(into)]
-    service: String,
-    /// The item's account identifier.
-    #[builder(into)]
-    account: String,
-    /// Restrict lookup to this entitled access group.
-    #[builder(into)]
-    access_group: Option<String>,
-    /// Backend to search, defaulting to data protection.
-    #[builder(default)]
-    backend: KeychainBackend,
-    /// Whether this lookup may involve the user, defaulting to allowing UI.
-    #[builder(default)]
-    interaction: SecretInteraction,
+    identifiers: ItemIdentifiers,
+    target: ReadTarget,
 }
 
 impl KeychainSecret {
     fn read(&self) -> Result<SecretBytes, SecretError> {
-        validate_identifiers(&self.service, &self.account)?;
-        self.backend
-            .validate(self.access_group.as_deref(), self.interaction)?;
-        self.read_validated()
-    }
-
-    // The caller has checked identifiers and backend options; store readers also validate
-    // write-specific configuration before reaching this path.
-    fn read_validated(&self) -> Result<SecretBytes, SecretError> {
-        let location = self.backend.resolve()?;
+        #[cfg(feature = "local-authentication")]
+        let _operation = self
+            .target
+            .context()
+            .map(crate::authentication::AuthenticationContext::operation);
+        let location = self.target.resolve()?;
         let mut query = backend::query(&location);
         query
             .class(ItemClass::generic_password())
-            .service(&self.service)
-            .account(&self.account)
-            .skip_authenticated_items(self.interaction == SecretInteraction::SkipProtectedItems)
+            .service(&self.identifiers.service)
+            .account(&self.identifiers.account)
             .load_data(true)
-            // An explicit group plus service/account identifies one local
-            // generic password; only a cross-group search needs ambiguity detection.
-            .limit(
-                if self.access_group.is_some() || self.backend != KeychainBackend::DataProtection {
-                    1
-                } else {
-                    2
-                },
-            );
-        if let Some(group) = &self.access_group {
-            query.access_group(group);
-        }
-        secret_from_search(query.search(), self.interaction)
+            .limit(1);
+        let skip_protected_items = match &self.target {
+            ReadTarget::DataProtection { scope, mode } => {
+                let skip_protected_items = mode.skips_protected_items();
+                query.skip_authenticated_items(skip_protected_items);
+                match scope {
+                    ReadScope::Group(group) => {
+                        query.access_group(group);
+                    }
+                    ReadScope::AllGroups => {
+                        query.limit(2);
+                    }
+                }
+                #[cfg(feature = "local-authentication")]
+                if let Some(context) = mode.context() {
+                    context.apply_query(&mut query);
+                }
+                skip_protected_items
+            }
+            #[cfg(target_os = "macos")]
+            ReadTarget::File(_) => false,
+        };
+        secret_from_search(query.search(), skip_protected_items)
     }
-}
-
-fn validate_identifiers(service: &str, account: &str) -> Result<(), SecretError> {
-    // Empty attributes can broaden a Keychain query beyond the intended item.
-    ensure!(
-        !service.is_empty() && !account.is_empty(),
-        ConfigurationSnafu {
-            reason: "service and account must be nonempty"
-        }
-    );
-    Ok(())
 }
 
 fn secret_from_search(
     result: Result<Vec<SearchResult>, security_framework::base::Error>,
-    interaction: SecretInteraction,
+    skip_protected_items: bool,
 ) -> Result<SecretBytes, SecretError> {
     let results = match result {
         Err(error) if error.code() == errSecItemNotFound => {
-            return match interaction {
-                SecretInteraction::Allow => NotFoundSnafu.fail(),
-                SecretInteraction::SkipProtectedItems => NotFoundWithoutInteractionSnafu.fail(),
+            return if skip_protected_items {
+                NotFoundWithoutInteractionSnafu.fail()
+            } else {
+                NotFoundSnafu.fail()
             };
         }
         result => result.context(AccessSnafu)?,
@@ -254,34 +215,6 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn empty_identifiers_are_rejected_on_read() {
-        for (service, account) in [("", "account"), ("service", ""), ("", "")] {
-            for interaction in [
-                SecretInteraction::Allow,
-                SecretInteraction::SkipProtectedItems,
-            ] {
-                let source = KeychainSecret::builder()
-                    .service(service)
-                    .account(account)
-                    .interaction(interaction)
-                    .build();
-                assert!(matches!(
-                    source.read(),
-                    Err(SecretError::Configuration {
-                        reason: "service and account must be nonempty"
-                    })
-                ));
-                let error = source.get_secret_value().await.unwrap_err();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("service and account must be nonempty")
-                );
-            }
-        }
-    }
-
     #[test]
     fn skipped_items_are_not_reported_as_definitely_absent() {
         let absent = || {
@@ -290,21 +223,18 @@ mod tests {
             ))
         };
         assert!(matches!(
-            secret_from_search(absent(), SecretInteraction::Allow),
+            secret_from_search(absent(), false),
             Err(SecretError::NotFound)
         ));
         assert!(matches!(
-            secret_from_search(absent(), SecretInteraction::SkipProtectedItems),
+            secret_from_search(absent(), true),
             Err(SecretError::NotFoundWithoutInteraction)
         ));
     }
 
     #[test]
     fn interaction_errors_are_preserved_in_both_query_modes() {
-        for interaction in [
-            SecretInteraction::Allow,
-            SecretInteraction::SkipProtectedItems,
-        ] {
+        for interaction in [false, true] {
             let error = security_framework::base::Error::from_code(
                 crate::platform::ERR_SEC_INTERACTION_NOT_ALLOWED,
             );

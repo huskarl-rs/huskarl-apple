@@ -18,12 +18,12 @@ use security_framework::{
 use security_framework_sys::base::{errSecDuplicateItem, errSecItemNotFound};
 use snafu::prelude::*;
 
-#[cfg(target_os = "macos")]
-use super::MissingItemReferenceSnafu;
 use super::{
-    AccessControlSnafu, ConfigurationSnafu, DeleteSnafu, KeychainBackend, KeychainSecret,
-    SecretError, SecretInteraction, WriteSnafu, backend,
+    AccessControlSnafu, DeleteSnafu, KeychainSecret, SecretError, WriteSnafu, backend,
+    configuration::{ItemIdentifiers, StoreTarget},
 };
+#[cfg(target_os = "macos")]
+use super::{ConfigurationSnafu, MissingItemReferenceSnafu};
 use crate::policy::{Authentication, Availability};
 
 /// Device-only protection requested when creating a generic-password item.
@@ -52,83 +52,45 @@ impl SecretAccessPolicy {
     }
 }
 
-/// Writable generic-password storage in the selected Keychain backend.
+/// Writable storage for one validated generic-password identity.
 ///
-/// The default data protection backend requires an explicit entitled access
-/// group and creates device-only items. File backends instead use one selected
-/// keychain and its ACLs; access groups and `SecretAccessPolicy` are rejected.
+/// Create through [`super::DataProtectionSecret::store`] or a file-backed item.
 /// Existing items retain their access policy; no backend synchronizes with iCloud.
-/// Reserve a service/account pair for this store rather than adopting an item
-/// whose protection policy is unknown.
-/// Service and account must be nonempty; operations and [`Self::reader`] validate them.
-///
-/// All operations run on a blocking pool and allow system authentication UI.
-/// Dropping a future does not cancel an in-progress Keychain operation.
-#[derive(Debug, Clone, Builder)]
+/// All operations run on a blocking pool. Dropping a future does not cancel an
+/// in-progress Keychain operation.
+#[derive(Debug, Clone)]
 pub struct KeychainSecretStore {
-    /// Service identifying the application's storage namespace.
-    #[builder(into)]
-    service: String,
-    /// Account identifying one stored secret.
-    #[builder(into)]
-    account: String,
-    /// Required for data protection; rejected for file-backed storage.
-    #[builder(into)]
-    access_group: Option<String>,
-    /// Data-protection creation policy; omitted means its default. Rejected for files.
-    access_policy: Option<SecretAccessPolicy>,
-    /// Backend to use for all operations.
-    #[builder(default)]
-    backend: KeychainBackend,
+    pub(super) identifiers: ItemIdentifiers,
+    pub(super) target: StoreTarget,
 }
 
 impl KeychainSecretStore {
-    /// Obtain a read provider for this exact item, allowing authentication UI.
-    ///
-    /// # Errors
-    /// Rejects empty identifiers and options incompatible with the selected backend.
-    pub fn reader(&self) -> Result<KeychainSecret, SecretError> {
-        self.validate()?;
-        Ok(KeychainSecret::builder()
-            .service(&self.service)
-            .account(&self.account)
-            .maybe_access_group(self.access_group.clone())
-            .backend(self.backend.clone())
-            .build())
-    }
-
-    fn validate(&self) -> Result<(), SecretError> {
-        super::validate_identifiers(&self.service, &self.account)?;
-        self.backend
-            .validate(self.access_group.as_deref(), SecretInteraction::Allow)?;
-        if self.backend == KeychainBackend::DataProtection {
-            ensure!(
-                self.access_group
-                    .as_ref()
-                    .is_some_and(|group| !group.is_empty()),
-                ConfigurationSnafu {
-                    reason: "writable data protection storage requires an explicit access group"
-                }
-            );
-        } else {
-            ensure!(
-                self.access_policy.is_none(),
-                ConfigurationSnafu {
-                    reason: "SecretAccessPolicy requires the data protection backend"
-                }
-            );
+    /// Obtain a read provider for this exact item, sharing its authentication context.
+    /// Authentication UI is allowed unless the context disables it.
+    #[must_use]
+    pub fn reader(&self) -> KeychainSecret {
+        KeychainSecret {
+            identifiers: self.identifiers.clone(),
+            target: self.target.reader(),
         }
-        Ok(())
     }
 
     fn query(&self, location: &Location) -> ItemSearchOptions {
         let mut query = backend::query(location);
         query
             .class(ItemClass::generic_password())
-            .service(&self.service)
-            .account(&self.account);
-        if let Some(group) = &self.access_group {
-            query.access_group(group);
+            .service(&self.identifiers.service)
+            .account(&self.identifiers.account);
+        match &self.target {
+            StoreTarget::DataProtection { access_group, .. } => {
+                query.access_group(access_group);
+            }
+            #[cfg(target_os = "macos")]
+            StoreTarget::File(_) => {}
+        }
+        #[cfg(feature = "local-authentication")]
+        if let Some(context) = self.target.context() {
+            context.apply_query(&mut query);
         }
         query
     }
@@ -138,8 +100,8 @@ impl KeychainSecretStore {
     /// # Errors
     /// Returns access, authentication, or malformed-result errors unchanged.
     pub async fn get(&self) -> Result<Option<SecretBytes>, SecretError> {
-        let reader = self.reader()?;
-        blocking::unblock(move || match reader.read_validated() {
+        let reader = self.reader();
+        blocking::unblock(move || match reader.read() {
             Ok(value) => Ok(Some(value)),
             Err(SecretError::NotFound) => Ok(None),
             Err(error) => Err(error),
@@ -168,8 +130,12 @@ impl KeychainSecretStore {
     pub async fn clear(&self) -> Result<(), SecretError> {
         let store = self.clone();
         blocking::unblock(move || {
-            store.validate()?;
-            let location = store.backend.resolve()?;
+            #[cfg(feature = "local-authentication")]
+            let _operation = store
+                .target
+                .context()
+                .map(crate::authentication::AuthenticationContext::operation);
+            let location = store.target.resolve()?;
             match store.query(&location).delete() {
                 Err(error) if error.code() == errSecItemNotFound => Ok(()),
                 result => result.context(DeleteSnafu),
@@ -179,8 +145,12 @@ impl KeychainSecretStore {
     }
 
     fn write(&self, value: &SecretBytes) -> Result<(), SecretError> {
-        self.validate()?;
-        let location = self.backend.resolve()?;
+        #[cfg(feature = "local-authentication")]
+        let _operation = self
+            .target
+            .context()
+            .map(crate::authentication::AuthenticationContext::operation);
+        let location = self.target.resolve()?;
         #[cfg(target_os = "macos")]
         if matches!(location, Location::FileKeychain(_)) {
             ensure!(
@@ -234,22 +204,30 @@ impl KeychainSecretStore {
                 Location::FileKeychain(keychain) => Location::FileKeychain(keychain.clone()),
                 _ => Location::DataProtectionKeychain,
             })
-            .set_service(&self.service)
-            .set_account_name(&self.account);
-        if let Some(group) = &self.access_group {
-            options.set_access_group(group);
-        }
-        #[cfg(target_os = "macos")]
-        if matches!(location, Location::FileKeychain(_)) {
-            return options.add().context(WriteSnafu);
-        }
-        let access = self.access_policy.unwrap_or_default().access_control()?;
+            .set_service(&self.identifiers.service)
+            .set_account_name(&self.identifiers.account);
+        let access = match &self.target {
+            StoreTarget::DataProtection {
+                access_group,
+                creation_policy,
+                ..
+            } => {
+                options.set_access_group(access_group);
+                creation_policy.access_control()?
+            }
+            #[cfg(target_os = "macos")]
+            StoreTarget::File(_) => return options.add().context(WriteSnafu),
+        };
         let original = options.to_dictionary();
         let (keys, values) = original.get_keys_and_values();
         let pairs: Vec<_> = keys.into_iter().zip(values).collect();
         let mut attributes = CFMutableDictionary::from_CFType_pairs(&pairs);
         // kSecAttrAccessControl; CF objects remain alive while retained here.
         attributes.set(CFString::new("accc").to_void(), access.to_void());
+        #[cfg(feature = "local-authentication")]
+        if let Some(context) = self.target.context() {
+            context.apply_attributes(&mut attributes);
+        }
         security_framework::item::add_item(attributes.to_immutable()).context(WriteSnafu)
     }
 }
@@ -289,81 +267,6 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
-
-    #[tokio::test]
-    async fn empty_identifiers_block_every_operation() {
-        for (service, account) in [("", "account"), ("service", ""), ("", "")] {
-            let backends = [
-                KeychainBackend::DataProtection,
-                // An invalid file path checks validation precedes opening a keychain.
-                #[cfg(target_os = "macos")]
-                KeychainBackend::File("relative.keychain-db".into()),
-            ];
-            for backend in backends {
-                let store = KeychainSecretStore::builder()
-                    .service(service)
-                    .account(account)
-                    .backend(backend)
-                    .build();
-                assert_empty_identifiers(store.reader());
-                assert_empty_identifiers(store.get().await);
-                assert_empty_identifiers(store.set(&SecretBytes::new(vec![1])).await);
-                assert_empty_identifiers(store.clear().await);
-                assert!(matches!(store.get_secret_value().await, Err(error)
-                        if error.to_string().contains("service and account must be nonempty")));
-            }
-        }
-    }
-
-    fn assert_empty_identifiers<T>(result: Result<T, SecretError>) {
-        assert!(matches!(
-            result.err(),
-            Some(SecretError::Configuration {
-                reason: "service and account must be nonempty"
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn incompatible_configuration_blocks_every_operation() {
-        let stores = [
-            KeychainSecretStore::builder()
-                .service("test")
-                .account("test")
-                .build(),
-            KeychainSecretStore::builder()
-                .service("test")
-                .account("test")
-                .backend(KeychainBackend::Login)
-                .access_group("group")
-                .build(),
-            KeychainSecretStore::builder()
-                .service("test")
-                .account("test")
-                .backend(KeychainBackend::Login)
-                .access_policy(SecretAccessPolicy::default())
-                .build(),
-        ];
-        for store in stores {
-            assert!(matches!(
-                store.reader(),
-                Err(SecretError::Configuration { .. })
-            ));
-            assert!(matches!(
-                store.get().await,
-                Err(SecretError::Configuration { .. })
-            ));
-            assert!(matches!(
-                store.set(&SecretBytes::new(vec![1])).await,
-                Err(SecretError::Configuration { .. })
-            ));
-            assert!(matches!(
-                store.clear().await,
-                Err(SecretError::Configuration { .. })
-            ));
-            assert!(store.get_secret_value().await.is_err());
-        }
-    }
 
     fn status(code: i32) -> SecretError {
         SecretError::Write {

@@ -39,12 +39,12 @@ def main():
     parser.add_argument("--delete", action="store_true", help="Delete keys selected by --cleanup")
     parser.add_argument("tests", nargs="*", metavar="TEST",
                         help="default: " + ", ".join(DEFAULT_TESTS)
-                        + "; also available: access_groups, user_presence")
+                        + "; also available: access_groups, user_presence, authentication_context, urlsession_mtls, urlsession_oauth")
     args = parser.parse_args()
     if (args.delete and not args.cleanup) or (args.cleanup and args.tests):
         parser.error("--delete requires --cleanup; cleanup does not accept test names")
     tests = args.tests or DEFAULT_TESTS
-    if any(t not in DEFAULT_TESTS + ["access_groups", "user_presence"] for t in tests):
+    if any(t not in DEFAULT_TESTS + ["access_groups", "user_presence", "authentication_context", "urlsession_mtls", "urlsession_oauth"] for t in tests):
         parser.error("unknown test executable")
     if sys.platform != "darwin":
         raise ValueError("Signed tests require macOS")
@@ -105,7 +105,7 @@ def main():
         kind = "example" if args.cleanup else "test"
         for test in (["cleanup-test-keys"] if args.cleanup else tests):
             print(f"Building and signing {test}", flush=True)
-            result = run("cargo", "rustc", "--locked", f"--{kind}", test,
+            result = run("cargo", "rustc", "--locked", "--features", "urlsession,local-authentication", f"--{kind}", test,
                          "--message-format=json", "--", "-C",
                          f"link-arg=-Wl,-sectcreate,__TEXT,__info_plist,{info}",
                          stdout=subprocess.PIPE, text=True)

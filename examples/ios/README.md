@@ -1,5 +1,10 @@
 # iOS simulator example
 
+For adding OAuth login to an iOS application, follow the dedicated iOS path in
+[connecting an Apple UI](../../docs/guide/apple_app.md#integrate-on-ios).
+This example establishes storage and bridging only; see
+[platform coverage](../../docs/reference/platforms.md) for the other checks.
+
 A minimal SwiftUI app linked to a Rust static library, sharing its source with
 the [macOS example](../apple/README.md). Store, load, and clear a
 disposable refresh token through `KeychainRefreshTokenStore`. No OAuth server,

@@ -1,5 +1,9 @@
 # Security model
 
+For the division of responsibility between OAuth login, OIDC identity, local
+authentication, and Apple networking, read
+[how Apple integrations fit OAuth](crate::_docs::explanation::apple_oauth).
+
 Keychain storage protects persisted secrets; Secure Enclave keys keep private
 operations in hardware. Choose the boundary that matches the application:
 secret reads place bytes in process memory, whereas signing and unsealing use
@@ -40,13 +44,32 @@ authentication context. Callers should wait for a relevant lifecycle event or
 use bounded backoff. Cancellation, authentication denial, missing entitlements,
 and other statuses remain nonretryable.
 
-This crate does not configure a reusable `LAContext`, a Touch ID grace period,
-or a per-call prompt deadline. Apple's [Touch ID reuse duration](https://developer.apple.com/documentation/localauthentication/lacontext/touchidauthenticationallowablereuseduration)
-is a separate authentication-context setting, not a Keychain idle timer.
-Do not assume a presence policy means exactly one fresh dialog for every call.
+With `local-authentication`, `AuthenticationContext` supplies a reusable
+`LAContext` to data protection secret operations and enclave key setup, signing,
+and unsealing. Clones share authentication state, prompt text, and interaction
+settings. It can adopt and export an objc2 `LAContext`; native aliases require
+explicit synchronization because the adapters use worker threads. See
+[authentication contexts](crate::_docs::guide::key_authentication).
+
+The stored access policy still applies. A context can disable authentication UI
+without treating a protected item as absent. File-backed items do not expose context options, and `SecretReadMode` makes
+using a context and skipping protected items mutually exclusive. Operations
+sharing a context are serialized; async property setters wait on blocking workers
+without blocking the UI executor. Await a setter before relying on its change.
+
+Apple's [Touch ID reuse duration](https://developer.apple.com/documentation/localauthentication/lacontext/touchidauthenticationallowablereuseduration)
+accepts a recent biometric device unlock; it is not an application idle timer
+or a timeout for the context's cached authentication. Do not assume a presence
+policy means exactly one fresh dialog for every call. Call `invalidate()` when
+ending a session; this affects every clone and can cancel pending authentication
+evaluations. Use a new context and reload keys or rebuild stores for a new session.
+
 An allowed prompt can wait for human input. Operations run on a blocking pool;
 dropping a future does not cancel an Apple operation already in progress.
-Generating, loading, and deleting keys are synchronous setup operations.
+Key generation, loading, deletion, and certificate installation/removal are
+also async and use the blocking pool. A dropped future may still finish its
+persistent changes. Context invalidation does not revoke plaintext or cancel
+operations that have already passed authentication. This crate does not impose a per-call prompt deadline.
 
 Finally, locking the Keychain does **not** revoke secret bytes, cached secrets,
 or native AES/HMAC keys already loaded into application memory. If the host app

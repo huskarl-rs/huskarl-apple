@@ -3,7 +3,9 @@
 mod support;
 
 use huskarl::{cache::RefreshTokenStore as _, token::RefreshToken};
-use huskarl_apple::keychain::{KeychainBackend, KeychainRefreshTokenStore, KeychainSecretStore};
+use huskarl_apple::keychain::{
+    FileKeychain, KeychainRefreshTokenStore, KeychainSecretStore, SecretError,
+};
 use huskarl_core::secrets::{Secret as _, SecretBytes, SecretString};
 use security_framework::os::macos::keychain::CreateOptions;
 
@@ -25,15 +27,13 @@ async fn file_storage_roundtrip_and_isolation() -> Result<(), Box<dyn std::error
                     .create(path)?,
             );
         }
-        let store = |path: &std::path::Path| {
-            KeychainSecretStore::builder()
-                .service("huskarl-isolation")
-                .account("same-account")
-                .backend(KeychainBackend::File(path.to_owned()))
-                .build()
+        let store = |path: &std::path::Path| -> Result<KeychainSecretStore, SecretError> {
+            Ok(FileKeychain::at(path.to_owned())?
+                .secret("huskarl-isolation", "same-account")?
+                .store())
         };
-        let first = store(&paths[0]);
-        let second = store(&paths[1]);
+        let first = store(&paths[0])?;
+        let second = store(&paths[1])?;
         assert!(first.get().await?.is_none());
         first.set(&SecretBytes::new(vec![0, 255])).await?;
         assert!(second.get().await?.is_none());
@@ -41,7 +41,7 @@ async fn file_storage_roundtrip_and_isolation() -> Result<(), Box<dyn std::error
         first.set(&SecretBytes::new(vec![])).await?;
         assert!(
             first
-                .reader()?
+                .reader()
                 .get_secret_value()
                 .await?
                 .value
@@ -52,12 +52,10 @@ async fn file_storage_roundtrip_and_isolation() -> Result<(), Box<dyn std::error
         first.clear().await?;
         first.clear().await?;
         assert_eq!(second.get_secret_value().await?.value.expose_secret(), &[2]);
-        let tokens = KeychainRefreshTokenStore::builder().storage(first).build();
+        let tokens = KeychainRefreshTokenStore::new(first);
         let token = RefreshToken::new(SecretString::new("test-token"), Some("binding".into()));
         tokens.set(&token).await?;
-        let reloaded = KeychainRefreshTokenStore::builder()
-            .storage(store(&paths[0]))
-            .build();
+        let reloaded = KeychainRefreshTokenStore::new(store(&paths[0])?);
         assert_eq!(reloaded.get().await?, Some(token));
         reloaded.clear().await?;
         assert!(tokens.get().await?.is_none());

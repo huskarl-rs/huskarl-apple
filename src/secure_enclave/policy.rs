@@ -14,6 +14,8 @@ use crate::policy::{Authentication, Availability};
 ///
 /// This policy does not configure `LAContext` reuse or promise a fresh prompt
 /// for every call. It also does not impose a timeout on an authentication UI.
+/// Enable `local-authentication` and pass an `authentication_context` to the
+/// key builder to share authentication state and control interaction.
 #[derive(Debug, Clone, Copy, Default, Builder, PartialEq, Eq)]
 pub struct KeyAccessPolicy {
     /// Requested availability class, defaulting to [`Availability::WhenUnlocked`].

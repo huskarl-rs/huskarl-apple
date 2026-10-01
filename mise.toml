@@ -2,7 +2,7 @@
 description = "Build, provision, sign, and run macOS integration tests"
 usage = '''
 arg "[tests]" var=#true help="Defaults to lifecycle, storage, and concurrent creation" {
-  choices "keychain_lifecycle" "keychain_storage" "load_or_generate" "access_groups" "user_presence"
+  choices "keychain_lifecycle" "keychain_storage" "load_or_generate" "access_groups" "user_presence" "authentication_context" "urlsession_mtls" "urlsession_oauth"
 }
 '''
 run = "python3 scripts/signed-tests.py {{ usage.tests | join(sep=' ') }}"
@@ -31,3 +31,31 @@ run = "python3 scripts/apple-example.py --macos {% if usage.build_only %}--build
 [tasks."docs:readme"]
 description = "Regenerate README from crate documentation"
 run = "cargo +nightly reedme"
+[tasks."test:ios"]
+description = "Run native transport and browser-adapter unit tests in an iOS simulator"
+run = "python3 scripts/ios-tests.py"
+
+[tasks."test:ios-device"]
+description = "Automatically sign and run enclave mTLS tests on a connected iPhone"
+run = "python3 scripts/ios-device-tests.py"
+
+[tasks."test:oauth"]
+description = "Run signed Secure Enclave OAuth mTLS tests against disposable Keycloak"
+run = "python3 scripts/oauth-tests.py"
+
+[tasks."test:oauth-ios"]
+description = "Run OAuth and certificate-bound resource checks from a connected iPhone"
+usage = 'arg "<host>" help="Mac LAN IPv4 address reachable from the iPhone"'
+run = "python3 scripts/oauth-tests.py --ios-device --host {{ usage.host }}"
+
+[tasks."test:browser"]
+description = "Launch the interactive macOS browser-login test with disposable Keycloak"
+run = "python3 scripts/browser-smoke.py"
+
+[tasks."example:native-session"]
+description = "Build and run a signed macOS browser-login, persisted DPoP, and API session"
+usage = '''
+flag "--build-only" help="Build without launching the app"
+flag "--unsigned" help="Compile-only ad-hoc bundle; requires --build-only"
+'''
+run = "python3 scripts/native-session.py {% if usage.build_only %}--build-only{% endif %} {% if usage.unsigned %}--unsigned{% endif %}"

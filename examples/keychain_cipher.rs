@@ -1,6 +1,6 @@
 //! Read a pre-provisioned 32-byte AES key from Keychain and use structured AEAD.
 //! Usage: keychain_cipher <service> <account>
-use huskarl_apple::keychain::KeychainSecret;
+use huskarl_apple::keychain::{DataProtectionKeychain, SecretReadMode};
 use huskarl_core::{
     crypto::cipher::{AeadDecryptor as _, AeadEncryptorSelector as _},
     jwk::OctBytes,
@@ -13,10 +13,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let service = args.next().ok_or("missing service argument")?;
     let account = args.next().ok_or("missing account argument")?;
-    let source = KeychainSecret::builder()
-        .service(service)
-        .account(account)
-        .build();
+    let source =
+        DataProtectionKeychain::search_all_groups(service, account, SecretReadMode::Allow)?;
     let cipher = AesGcmKey::from_secret(source.mapped(OctBytes::new("A256GCM"))).await?;
     let encrypted = cipher
         .select_encryptor()

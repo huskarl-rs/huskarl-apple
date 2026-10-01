@@ -4,7 +4,10 @@ mod support;
 
 use huskarl::{cache::RefreshTokenStore as _, token::RefreshToken};
 use huskarl_apple::{
-    keychain::{KeychainRefreshTokenStore, KeychainSecretStore, SecretAccessPolicy},
+    keychain::{
+        DataProtectionKeychain, KeychainRefreshTokenStore, KeychainSecretStore, SecretAccessPolicy,
+        SecretError,
+    },
     secure_enclave::KeyAvailability,
 };
 use huskarl_core::secrets::{Secret as _, SecretBytes, SecretString};
@@ -12,17 +15,20 @@ use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn store(service: &str, group: &str, availability: KeyAvailability) -> KeychainSecretStore {
-    KeychainSecretStore::builder()
-        .service(service)
-        .account("token")
-        .access_group(group)
-        .access_policy(
+fn store(
+    service: &str,
+    group: &str,
+    availability: KeyAvailability,
+) -> Result<KeychainSecretStore, SecretError> {
+    Ok(DataProtectionKeychain::new(group)?
+        .secret(service, "token")?
+        .store()
+        .creation_policy(
             SecretAccessPolicy::builder()
                 .availability(availability)
                 .build(),
         )
-        .build()
+        .build())
 }
 
 #[tokio::test]
@@ -30,15 +36,15 @@ fn store(service: &str, group: &str, availability: KeyAvailability) -> KeychainS
 async fn secret_updates_preserve_policy() -> TestResult {
     let service = support::unique_label("huskarl-apple-storage")?;
     let group = std::env::var("HUSKARL_TEST_ACCESS_GROUP")?;
-    let original = store(&service, &group, KeyAvailability::WhenUnlocked);
+    let original = store(&service, &group, KeyAvailability::WhenUnlocked)?;
     let result: TestResult = async {
         original.clear().await?;
         assert!(original.get().await?.is_none());
         original.set(&SecretBytes::new(vec![0, 255, 1])).await?;
-        let reloaded = store(&service, &group, KeyAvailability::AfterFirstUnlock);
+        let reloaded = store(&service, &group, KeyAvailability::AfterFirstUnlock)?;
         assert_eq!(
             reloaded
-                .reader()?
+                .reader()
                 .get_secret_value()
                 .await?
                 .value
@@ -84,18 +90,15 @@ async fn secret_updates_preserve_policy() -> TestResult {
 async fn refresh_tokens_survive_reload_and_rotation() -> TestResult {
     let service = support::unique_label("huskarl-apple-storage")?;
     let group = std::env::var("HUSKARL_TEST_ACCESS_GROUP")?;
-    let storage = store(&service, &group, KeyAvailability::WhenUnlocked);
-    let tokens = KeychainRefreshTokenStore::builder()
-        .storage(storage.clone())
-        .build();
+    let storage = store(&service, &group, KeyAvailability::WhenUnlocked)?;
+    let tokens = KeychainRefreshTokenStore::new(storage.clone());
     let result: TestResult = async {
         tokens.clear().await?;
         assert!(tokens.get().await?.is_none());
         let bound = RefreshToken::new(SecretString::new("original"), Some("thumbprint".into()));
         tokens.set(&bound).await?;
-        let reloaded = KeychainRefreshTokenStore::builder()
-            .storage(store(&service, &group, KeyAvailability::WhenUnlocked))
-            .build();
+        let reloaded =
+            KeychainRefreshTokenStore::new(store(&service, &group, KeyAvailability::WhenUnlocked)?);
         assert_eq!(reloaded.get().await?, Some(bound));
         let rotated = RefreshToken::new(SecretString::new("rotated"), None);
         reloaded.set(&rotated).await?;

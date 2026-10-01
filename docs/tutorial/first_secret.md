@@ -15,17 +15,15 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 2. Replace `src/main.rs` with this program:
 
 ```rust,no_run
-use huskarl_apple::keychain::{KeychainBackend, KeychainSecretStore};
+use huskarl_apple::keychain::FileKeychain;
 use huskarl_core::secrets::SecretBytes;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account = format!("tutorial-{}", std::process::id());
-    let store = KeychainSecretStore::builder()
-        .service("io.example.huskarl-tutorial")
-        .account(account)
-        .backend(KeychainBackend::Login)
-        .build();
+    let store = FileKeychain::login()
+        .secret("io.example.huskarl-tutorial", account)?
+        .store();
     store.set(&SecretBytes::new(b"hello keychain".to_vec())).await?;
     let value = store.get().await?;
     store.clear().await?;

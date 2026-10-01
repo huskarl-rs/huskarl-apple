@@ -8,15 +8,15 @@ retains the selected group:
 ```rust,no_run
 use huskarl_apple::secure_enclave::Es256PrivateKey;
 
-# fn example() -> Result<(), huskarl_apple::SetupError> {
+# async fn example() -> Result<(), huskarl_apple::SetupError> {
 let key = Es256PrivateKey::generate_with()
     .label("io.example.signing-v1")
     .access_group("TEAMID.io.example.shared")
-    .generate()?;
+    .generate().await?;
 let loaded = Es256PrivateKey::load_with()
     .label("io.example.signing-v1")
     .access_group("TEAMID.io.example.shared")
-    .load()?;
+    .load().await?;
 # Ok(())
 # }
 ```

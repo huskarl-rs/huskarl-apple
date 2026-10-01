@@ -11,14 +11,14 @@ use huskarl_core::crypto::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let label = support::unique_label("huskarl-apple-signing-example")?;
-    let key = Es256PrivateKey::generate(&label)?;
+    let key = Es256PrivateKey::generate(&label).await?;
     let result: Result<(), Box<dyn std::error::Error>> = async {
         let signature = key.sign(b"header.payload").await?;
         let criteria = KeyMatch::builder().alg("ES256").build();
         key.verifier()?
             .verify(b"header.payload", &signature, &criteria)
             .await?;
-        let loaded = Es256PrivateKey::load(&label)?;
+        let loaded = Es256PrivateKey::load(&label).await?;
         assert_eq!(
             loaded.public_key_jwk().thumbprint(),
             key.public_key_jwk().thumbprint()
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
     .await;
-    let cleanup = key.delete();
+    let cleanup = key.delete_key_and_associated_items().await;
     result?;
     cleanup?;
     println!("Deleted the example key.");

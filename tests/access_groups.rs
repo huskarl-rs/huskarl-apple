@@ -9,9 +9,9 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 macro_rules! group_test {
     ($name:ident, $key:ty, $identity:expr) => {
-        #[test]
+        #[tokio::test]
         #[ignore = "requires signed executable, Secure Enclave, and two configured entitled groups"]
-        fn $name() -> TestResult {
+        async fn $name() -> TestResult {
             let group_a = std::env::var("HUSKARL_TEST_ACCESS_GROUP_A")?;
             let group_b = std::env::var("HUSKARL_TEST_ACCESS_GROUP_B")?;
             assert_ne!(group_a, group_b);
@@ -20,51 +20,59 @@ macro_rules! group_test {
             let first = <$key>::generate_with()
                 .label(&label)
                 .access_group(&group_a)
-                .generate()?;
-            let result: TestResult = (|| {
+                .generate()
+                .await?;
+            let result: TestResult = async {
                 assert!(matches!(
                     <$key>::load_with()
                         .label(&label)
                         .access_group(&group_b)
-                        .load(),
+                        .load()
+                        .await,
                     Err(SetupError::KeyNotFound)
                 ));
                 let second = <$key>::generate_with()
                     .label(&label)
                     .access_group(&group_b)
-                    .generate()?;
-                let result: TestResult = (|| {
+                    .generate()
+                    .await?;
+                let result: TestResult = async {
                     assert!(matches!(
-                        <$key>::load(&label),
+                        <$key>::load(&label).await,
                         Err(SetupError::AmbiguousKey)
                     ));
                     let loaded_a = <$key>::load_with()
                         .label(&label)
                         .access_group(&group_a)
-                        .load()?;
+                        .load()
+                        .await?;
                     let loaded_b = <$key>::load_with()
                         .label(&label)
                         .access_group(&group_b)
-                        .load()?;
+                        .load()
+                        .await?;
                     assert_eq!(identity(&loaded_a), identity(&first));
                     assert_eq!(identity(&loaded_b), identity(&second));
                     assert_ne!(identity(&loaded_a), identity(&loaded_b));
                     Ok(())
-                })();
-                let cleanup = second.delete();
+                }
+                .await;
+                let cleanup = second.delete_key_and_associated_items().await;
                 result?;
                 cleanup?;
                 assert!(matches!(
                     <$key>::load_with()
                         .label(&label)
                         .access_group(&group_b)
-                        .load(),
+                        .load()
+                        .await,
                     Err(SetupError::KeyNotFound)
                 ));
-                assert_eq!(identity(&<$key>::load(&label)?), identity(&first));
+                assert_eq!(identity(&<$key>::load(&label).await?), identity(&first));
                 Ok(())
-            })();
-            let cleanup = first.delete();
+            }
+            .await;
+            let cleanup = first.delete_key_and_associated_items().await;
             result?;
             cleanup?;
             Ok(())
@@ -86,21 +94,19 @@ group_test!(
 #[tokio::test]
 #[ignore = "requires signed executable and two configured entitled groups"]
 async fn secret_writes_and_deletes_are_group_scoped() -> TestResult {
-    use huskarl_apple::keychain::KeychainSecretStore;
+    use huskarl_apple::keychain::DataProtectionKeychain;
     use huskarl_core::secrets::{Secret as _, SecretBytes};
     let group_a = std::env::var("HUSKARL_TEST_ACCESS_GROUP_A")?;
     let group_b = std::env::var("HUSKARL_TEST_ACCESS_GROUP_B")?;
     assert_ne!(group_a, group_b);
     let service = support::unique_label("huskarl-apple-secret-groups")?;
-    let a = KeychainSecretStore::builder()
-        .service(&service)
-        .account("same-account")
-        .access_group(group_a)
+    let a = DataProtectionKeychain::new(group_a)?
+        .secret(&service, "same-account")?
+        .store()
         .build();
-    let b = KeychainSecretStore::builder()
-        .service(&service)
-        .account("same-account")
-        .access_group(group_b)
+    let b = DataProtectionKeychain::new(group_b)?
+        .secret(&service, "same-account")?
+        .store()
         .build();
     let result: TestResult = async {
         a.set(&SecretBytes::new(vec![1])).await?;

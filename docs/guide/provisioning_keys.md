@@ -6,13 +6,13 @@ For startup provisioning, both key types provide `load_or_generate()`:
 use huskarl_apple::secure_enclave::{Es256PrivateKey, KeyAccessPolicy};
 use std::path::Path;
 
-# fn example(lock_path: &Path) -> Result<(), huskarl_apple::SetupError> {
+# async fn example(lock_path: &Path) -> Result<(), huskarl_apple::SetupError> {
 let key = Es256PrivateKey::load_or_generate()
     .label("io.example.signing-v1")
     .access_group("TEAMID.io.example.shared")
     .lock_path(lock_path)
-    .access_policy(KeyAccessPolicy::default())
-    .call()?;
+    .creation_policy(KeyAccessPolicy::default())
+    .load_or_generate().await?;
 # Ok(())
 # }
 ```
@@ -38,8 +38,10 @@ must already exist. Do not remove or replace the file while callers may use it.
 It contains no key material and remains on disk after the OS lock is released.
 The OS releases the lock on process exit, including crashes.
 
-This is synchronous setup and may wait for another creator or system
-authentication. Use a blocking worker when calling from an async application.
+This async operation uses a blocking worker when waiting for another creator
+or system authentication. Await it directly. Dropping the future does not cancel
+a worker already running: it can still create a key and holds the lock until it
+finishes.
 Direct `generate()` calls, external writers, and concurrent deletion do not
 participate in this protocol; coordinate those separately. A key created before
 a process exits is loaded on the next attempt.

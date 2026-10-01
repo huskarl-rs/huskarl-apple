@@ -11,6 +11,7 @@ categories = ["authentication"]
 readme = "README.md"
 
 [package.metadata.docs.rs]
+features = ["urlsession", "web-authentication", "local-authentication"]
 default-target = "aarch64-apple-darwin"
 targets = [
     "aarch64-apple-darwin",
@@ -28,17 +29,89 @@ huskarl-core = { version = "0.10", default-features = false }
 huskarl = { version = "0.11", default-features = false }
 serde_json = "1"
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
-security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
 security-framework-sys = "2"
 snafu = { version = "0.9", default-features = false, features = ["std", "rust_1_81"] }
+# URLSession HTTP client (`urlsession` feature).
+block2 = { version = "0.6", optional = true }
+bytes = { version = "1", optional = true }
+futures-channel = { version = "0.3", optional = true }
+http = { version = "1", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-local-authentication = { version = "0.3", optional = true, default-features = false, features = ["std", "LAContext"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "block2",
+    "NSArray",
+    "NSData",
+    "NSDate",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSError",
+    "NSHTTPCookieStorage",
+    "NSObject",
+    "NSOperation",
+    "NSString",
+    "NSURL",
+    "NSURLAuthenticationChallenge",
+    "NSURLCache",
+    "NSURLCredential",
+    "NSURLCredentialStorage",
+    "NSURLError",
+    "NSURLProtectionSpace",
+    "NSURLRequest",
+    "NSURLResponse",
+    "NSURLSession",
+] }
+objc2-security = { version = "0.3", optional = true, default-features = false, features = ["std", "objc2", "SecBase", "SecTrust"] }
+objc2-authentication-services = { version = "0.3", optional = true, default-features = false, features = ["std", "block2", "ASFoundation", "ASWebAuthenticationSession", "ASWebAuthenticationSessionCallback"] }
+url = { version = "2", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSWindow", "NSResponder"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-ui-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "UIWindow", "UIView", "UIResponder"] }
 
 [dev-dependencies]
+base64 = "0.23"
+sha2 = "0.11"
+bytes = "1"
 http = "1"
 huskarl-reqwest = { version = "0.9", features = ["rustls-tls"] }
 huskarl-crypto-native = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+rcgen = "0.14"
+rustls = "0.23"
+time = "0.3"
+tokio-rustls = "0.26"
 
 [[example]]
 name = "cleanup-test-keys"
 path = "support/cleanup_test_keys.rs"
+
+[features]
+## Enables reusable authentication contexts for Keychain and Secure Enclave operations.
+local-authentication = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-local-authentication"]
+## Enables native browser authentication on the application's main thread.
+web-authentication = [
+    "dep:block2",
+    "dep:futures-channel",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-authentication-services",
+    "dep:objc2-app-kit",
+    "dep:objc2-ui-kit",
+    "dep:url",
+]
+## Enables `UrlSessionClient`, an `HttpClient` backed by Apple's URLSession.
+urlsession = [
+    "dep:block2",
+    "dep:bytes",
+    "dep:futures-channel",
+    "dep:http",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-security",
+]

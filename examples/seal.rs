@@ -8,10 +8,10 @@ use huskarl_core::crypto::seal::{AeadSealer as _, AeadUnsealer as _};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let label = support::unique_label("huskarl-apple-sealing-example")?;
-    let key = SealingKey::generate(&label)?;
+    let key = SealingKey::generate(&label).await?;
     let result: Result<(), Box<dyn std::error::Error>> = async {
         let sealed = key.seal(b"secret payload", b"example-context").await?;
-        let loaded = SealingKey::load(&label)?;
+        let loaded = SealingKey::load(&label).await?;
         let plaintext = loaded
             .unseal(&sealed.bundle, b"example-context", sealed.kid.as_deref())
             .await?;
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
     .await;
-    let cleanup = key.delete();
+    let cleanup = key.delete_key_and_associated_items().await;
     result?;
     cleanup?;
     println!("Deleted the example key.");
