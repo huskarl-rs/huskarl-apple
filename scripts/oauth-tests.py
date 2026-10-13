@@ -162,6 +162,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        sys.exit(130)
     except (subprocess.CalledProcessError, ValueError, RuntimeError, OSError) as error:
         print(f"OAuth tests: {error}", file=sys.stderr)
         sys.exit(1)

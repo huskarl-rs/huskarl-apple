@@ -18,6 +18,21 @@ To include the optional URLSession client and its local HTTP/TLS tests, add
 to open loopback sockets. The Secure Enclave mTLS test uses the signed workflow
 below.
 
+To test the session controller and its lifecycle races, run
+`cargo test --features session --lib session::`. These tests use in-memory stores
+and a scripted HTTP client; they do not present native authentication UI.
+
+The native-session example's private executor has a custom test harness so its
+checks run on the actual process main thread:
+
+```sh
+cargo test --manifest-path examples/native-session/rust/Cargo.toml --test main_thread_executor
+```
+
+It exercises worker wakes, coalescing, idle tasks, local task ownership, nested
+spawning, and Tokio timers using the native run loop. It requires no signing,
+provider configuration, or interactive UI, and runs with the example's test suite.
+
 To include the native browser adapter, use `--features web-authentication`, or
 `--all-features` to test all optional adapters. Its automated tests cover URL validation,
 callback matching, native errors, and completion/cancellation ordering.

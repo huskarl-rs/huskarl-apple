@@ -21,10 +21,12 @@ requires an API accepting DPoP-bound tokens. Register exactly
 provider's API scopes and refresh-token requirements; do not include `openid`
 in this example, which does not implement ID-token verification.
 
-Set `ISSUER`, `CLIENT_ID`, `REDIRECT_URI`, `RESOURCE_URL`, `SCOPE`,
-`HUSKARL_SESSION_ID`, and `HUSKARL_STATE_DIR` using the example README's
+Set `ISSUER`, `CLIENT_ID`, `REDIRECT_URI`, `RESOURCE_URL`, and `SCOPE` using the example README's
 [configuration instructions](https://github.com/huskarl-rs/huskarl-apple/tree/main/examples/native-session#configure-and-run).
-The session ID is a stable local storage slot, chosen before login. Give distinct
+The launcher supplies a default `HUSKARL_SESSION_ID` of `example-api-primary`
+and creates `HUSKARL_STATE_DIR` under
+`~/Library/Application Support/HuskarlNativeSession/<session-id>`.
+Both can be overridden. The session ID is a stable local storage slot, chosen before login. Give distinct
 providers, clients, or simultaneous sessions distinct slots and state directories.
 
 Then run from the repository root:
@@ -39,60 +41,150 @@ status and response size. Quit and relaunch with the same configuration: the
 first request should refresh the saved session without another browser login
 while the refresh token remains valid.
 
-## Compose the session in your application
+## Own the session with `AppleSession`
 
-1. **Own the saved session.** Choose stable Keychain identifiers and an enclave
-   key label. Coordinate every process that can rotate that refresh token. The
-   example holds a process-lifetime lock in the session's state directory.
-2. **Restore credentials.** Read the token using `KeychainRefreshTokenStore` and
-   load the enclave key. Compare the saved token's DPoP thumbprint with the key.
-   Handle [permanent key loss](crate::_docs::guide::device_migration) separately
-   from locked or denied access.
-3. **Configure the grant.** Supply the provider, public-client authentication,
-   HTTP client, registered redirect, and `DPoP` signer to
-   `AuthorizationCodeGrant`. Preserve the pending state from each `start` call.
-4. **Present login.** Pass that attempt's authorization URL to
-   `WebAuthenticationSession` and its callback to `grant.complete`. Follow
-   [browser login](crate::_docs::guide::browser_login) for main-thread and
-   redirect requirements. Cancellation starts a fresh attempt on the next click.
-5. **Persist and authorize.** Connect `GrantTokenSource` with `NoSource` for
-   explicitly initiated interactive login, `InMemoryTokenCache`, and
-   `HttpAuthorizer`. Prime the source with the completed token response. Persist
-   its refresh token and DPoP binding, including replacements during rotation.
-6. **Send requests.** Obtain authorization headers for the actual method and
-   final URL, then execute the request. Pass responses back to the authorizer
-   for challenge handling. The example permits one GET retry for a supported
-   challenge; writes need a separate idempotency policy.
+Enable `session` (and `urlsession` if using Apple's HTTP transport).
+The application supplies a main-thread executor; see
+[the application integration guide](crate::_docs::guide::apple_app). Supply an
+existing `AuthorizationCodeGrant` and a dedicated `KeychainRefreshTokenStore`:
 
-The example's
-[Rust implementation](https://github.com/huskarl-rs/huskarl-apple/blob/main/examples/native-session/rust/src/lib.rs)
-is the complete composition. To transfer its ownership model into SwiftUI or
-UIKit, follow [connecting an Apple UI](crate::_docs::guide::apple_app).
+```rust,no_run
+# #[cfg(all(feature = "session", any(target_os = "macos", target_os = "ios")))]
+# fn configure(grant: huskarl::grant::authorization_code::AuthorizationCodeGrant,
+#     store: huskarl_apple::keychain::KeychainRefreshTokenStore,
+#     main_thread: objc2::MainThreadMarker) {
+use huskarl_apple::session::AppleSession;
 
-## Handle persistence failure and logout
+let (session, driver) = AppleSession::builder()
+    .grant(grant)
+    .refresh_store(store)
+    .main_thread(main_thread)
+    .build();
 
-If the server rotates a token but Keychain persistence fails, retain the new
-token in memory and report that restart recovery may fail. Do not silently
-revert to the old token. Initial login persistence failure also needs an explicit
-failure path. The example distinguishes these cases; storage and server rotation
-cannot form a single transaction.
+// Schedule driver.run() on your main-thread executor before awaiting operations.
+// Keep it running until session.shutdown().await completes.
+# let _ = (session, driver);
+# }
+```
 
-Gate new operations during logout, clear cached and in-memory credentials, and
-remove the saved token. If deletion fails, keep requests gated and offer a logout
-retry. The example retains the enclave key for future login. Local logout does
-not revoke server tokens or clear provider cookies; provider logout and revocation
-require separate integration.
+The grant retains provider configuration, client authentication, redirect URI,
+transport, OIDC verification and DPoP signing. The controller uses the same grant
+for interactive completion and refresh. Each attempt accepts the existing
+`StartInput`, with native presentation and token-endpoint resource options separate:
 
-Verify sign-in, repeated requests, restart restoration, cancellation/retry, and
-logout followed by restart with the example's lifecycle walkthrough. Also check
-denied Keychain access and expired refresh tokens without entering automatic
-browser retry loops.
+```rust,no_run
+# #[cfg(all(feature = "session", any(target_os = "macos", target_os = "ios")))]
+# async fn interact(session: &huskarl_apple::session::AppleSession,
+#     window: &huskarl_apple::web_authentication::PresentationAnchor)
+#     -> Result<(), huskarl_apple::session::SessionError> {
+use huskarl::grant::authorization_code::StartInput;
+use huskarl_apple::session::{SessionPhase, SignInOptions};
+
+let state = session.restore().await?;
+if state.phase == SessionPhase::SignedOut {
+    let outcome = session.sign_in(
+        window,
+        StartInput::builder().scope(vec!["read".into()]).build(),
+        SignInOptions::default(),
+    ).await?;
+    // outcome.id_token is verified by the configured grant, if present.
+    // Access and refresh tokens remain inside the controller.
+    let _ = outcome;
+}
+
+let access = session.access()?;
+let method = http::Method::GET;
+let uri = "https://api.example.com/profile".parse().unwrap();
+let headers = access.get_headers(&method, &uri).await?;
+// Send the request with these headers, then call:
+// access.process_response(&uri, &response.headers).await?;
+let _ = headers;
+# Ok(())
+# }
+```
+
+`subscribe()` is a coalescing stream of secret-free snapshots; `snapshot()` reads
+one synchronously. `Ready` means local credentials are available, not that the
+server has verified a restored refresh token. The first request refreshes it.
+A failed rotation write reports `Ready` with `UnsavedChanges`, retaining the new
+token in memory. A definitively rejected refresh reports `ReauthenticationRequired`.
+Temporary network failures do not sign the user out.
+
+The controller owns the browser attempt, source, cache, and authorizer. It
+serializes credential operations while your HTTP requests can run concurrently.
+`SessionAccess` handles are revoked on lock/logout/new login, including responses
+arriving from an older generation. Already-issued headers and sent requests
+cannot be retracted. Retry GET challenges explicitly; do not retry writes without
+an API idempotency contract.
+
+## Authorize requests from background Rust tasks
+
+`AppleSession` and its driver stay on the main thread. The `SessionAccess`
+returned by `session.access()` is `Send + Sync`; clone or move it into background
+workers. Both authorization methods return owned `Send` futures. For example,
+with an existing Tokio runtime:
+
+```rust,no_run
+# #[cfg(all(feature = "session", any(target_os = "macos", target_os = "ios")))]
+# fn background(session: &huskarl_apple::session::AppleSession)
+#     -> Result<(), huskarl_apple::session::SessionError> {
+let access = session.access()?;
+tokio::spawn(async move {
+    let uri = http::Uri::from_static("https://api.example.com/profile");
+    let headers = access.get_headers(&http::Method::GET, &uri).await?;
+    // Send the request in this worker, then await
+    // access.process_response(&uri, &response.headers).
+    Ok::<_, huskarl_apple::session::SessionError>(headers)
+});
+# Ok(())
+# }
+```
+
+The main-thread driver must continue running while workers await results. Do not
+block the AppKit thread waiting for a worker. Authorization and response processing
+remain serialized by the driver; HTTP execution belongs to the worker. Lock,
+logout, or another login revokes existing handles. Obtain a new handle from the
+controller after it becomes ready again. Requests made after the driver stops
+return `SessionError::Closed`.
+
+## Cancellation, locking, and logout
+
+`cancel_sign_in()` or dropping its result future cancels browser/network work.
+If credential persistence has begun, the driver finishes it and removes the
+cancelled attempt's credentials before allowing another login. Other operation
+futures may be dropped without cancelling their queued work.
+
+`lock()` immediately gates access, waits for credential mutations, and drops token
+memory while retaining saved credentials. Call `restore()` to resume. It does not
+invalidate authentication contexts embedded in the supplied key/store or promise
+a fresh biometric prompt. Configure those adapters' policies explicitly; if you
+invalidate a context yourself, rebuild adapters with a fresh context before reuse.
+
+`logout()` immediately gates access, settles outstanding writes, and deletes the
+saved token. Failed deletion leaves `CleanupRequired`; retry logout. Binding
+mismatches on restore also require explicit logout and preserve the stored token
+until that action. Local logout does not revoke server tokens, delete the signing
+key, or clear provider cookies.
+
+`shutdown()` drains outstanding work and stops the driver while retaining saved
+credentials. Await it before stopping the executor. Dropping the driver cannot
+cancel a native Keychain operation already running on a worker. The example
+refuses termination while busy, then defers AppKit termination until shutdown
+and driver exit complete.
+
+Use one controller per saved-session slot. The application must coordinate other
+processes using the same slot; the example retains a file lock for the driver's
+lifetime. Do not mutate the supplied store or grant through external clones.
+
+The [native example](https://github.com/huskarl-rs/huskarl-apple/tree/main/examples/native-session)
+uses this controller directly. Its Rust bridge contains application configuration,
+HTTP execution, and completion callbacks, rather than a second session implementation.
 
 ## Adapt the choices
 
 For a provider without DPoP, keep browser PKCE and Keychain storage but adapt the
 grant and authorizer for that provider's token type; the supplied complete example
-intentionally rejects non-DPoP sessions. For an identity UI, configure Huskarl's
+uses a DPoP-configured grant. The controller itself supports bearer sessions too. For an identity UI, configure Huskarl's
 OIDC issuer and ID-token verification before displaying identity claims. See
 [Huskarl's authorization-code API](https://docs.rs/huskarl/latest/huskarl/grant/authorization_code/).
 

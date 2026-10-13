@@ -25,7 +25,13 @@ pub fn failure(operation: &str, error: &(dyn StdError + 'static), recovery: &str
     let mut current = Some(error);
     while let Some(cause) = current {
         chain.push(cause);
-        current = cause.source();
+        // Core Error renders its erased cause itself and skips it in source().
+        // Include it explicitly for typed redaction and native recovery hints.
+        current = if let Some(core) = cause.downcast_ref::<Error>() {
+            Some(core.cause())
+        } else {
+            cause.source()
+        };
     }
     // A provider's error description and a parser's input excerpt can contain
     // credentials. Use the OAuth verdict or parser location instead.
@@ -144,9 +150,6 @@ impl<C> TracedClient<C> {
             inner,
             attempts: Arc::new(AtomicUsize::new(0)),
         }
-    }
-    pub fn attempts(&self) -> usize {
-        self.attempts.load(Ordering::Relaxed)
     }
 }
 

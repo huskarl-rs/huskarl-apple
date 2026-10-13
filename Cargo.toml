@@ -11,7 +11,7 @@ categories = ["authentication"]
 readme = "README.md"
 
 [package.metadata.docs.rs]
-features = ["urlsession", "web-authentication", "local-authentication"]
+features = ["urlsession", "web-authentication", "local-authentication", "session"]
 default-target = "aarch64-apple-darwin"
 targets = [
     "aarch64-apple-darwin",
@@ -36,6 +36,7 @@ snafu = { version = "0.9", default-features = false, features = ["std", "rust_1_
 block2 = { version = "0.6", optional = true }
 bytes = { version = "1", optional = true }
 futures-channel = { version = "0.3", optional = true }
+futures-util = { version = "0.3", optional = true, features = ["async-await"] }
 http = { version = "1", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-local-authentication = { version = "0.3", optional = true, default-features = false, features = ["std", "LAContext"] }
@@ -92,6 +93,8 @@ name = "cleanup-test-keys"
 path = "support/cleanup_test_keys.rs"
 
 [features]
+## Enables the main-thread native authorization-code session controller.
+session = ["web-authentication", "dep:futures-util", "dep:http"]
 ## Enables reusable authentication contexts for Keychain and Secure Enclave operations.
 local-authentication = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-local-authentication"]
 ## Enables native browser authentication on the application's main thread.

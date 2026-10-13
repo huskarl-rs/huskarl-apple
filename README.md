@@ -22,8 +22,9 @@ Start with [how the integrations fit together](https://docs.rs/huskarl-apple/lat
 | Application need | Adapter | Cargo feature |
 |---|---|---|
 | Present browser login | `web_authentication::WebAuthenticationSession` | `web-authentication` |
+| Own a native login/session lifecycle | `session::AppleSession` | `session` |
 | Persist refresh tokens | [`keychain::KeychainRefreshTokenStore`](https://docs.rs/huskarl-apple/latest/huskarl_apple/keychain/refresh/struct.KeychainRefreshTokenStore.html) | None |
-| Sign DPoP proofs with a hardware key | [`secure_enclave::Es256PrivateKey`](https://docs.rs/huskarl-apple/latest/huskarl_apple/secure_enclave/signer/struct.Es256PrivateKey.html) | None |
+| Sign `DPoP` proofs with a hardware key | [`secure_enclave::Es256PrivateKey`](https://docs.rs/huskarl-apple/latest/huskarl_apple/secure_enclave/signer/struct.Es256PrivateKey.html) | None |
 | Control local authentication | `authentication::AuthenticationContext` | `local-authentication` |
 | Use Apple networking and TLS client identities | `urlsession::UrlSessionClient` | `urlsession` |
 | Store other secrets or sign and seal data | [`keychain`](https://docs.rs/huskarl-apple/latest/huskarl_apple/keychain/) and [`secure_enclave`](https://docs.rs/huskarl-apple/latest/huskarl_apple/secure_enclave/) | None |
@@ -51,7 +52,7 @@ enterprise SSO adapters are outside this crate’s supplied integrations; see
 - **Solve a task:** [present browser login](https://docs.rs/huskarl-apple/latest/huskarl_apple/_docs/guide/browser_login/),
   [persist refresh tokens](https://docs.rs/huskarl-apple/latest/huskarl_apple/_docs/guide/refresh_tokens/),
   [use Apple networking and mTLS](https://docs.rs/huskarl-apple/latest/huskarl_apple/_docs/guide/native_networking/),
-  [choose a DPoP key policy](https://docs.rs/huskarl-apple/latest/huskarl_apple/_docs/guide/dpop_policy/), or
+  [choose a `DPoP` key policy](https://docs.rs/huskarl-apple/latest/huskarl_apple/_docs/guide/dpop_policy/), or
   [sign an app](https://docs.rs/huskarl-apple/latest/huskarl_apple/_docs/guide/signing_an_app/).
 - **Understand:** [Apple and OAuth responsibilities](https://docs.rs/huskarl-apple/latest/huskarl_apple/_docs/explanation/apple_oauth/),
   [the security model](https://docs.rs/huskarl-apple/latest/huskarl_apple/_docs/explanation/security_model/), and

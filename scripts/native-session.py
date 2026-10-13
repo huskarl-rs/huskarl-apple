@@ -22,6 +22,24 @@ def authorized(value, patterns):
         for pattern in patterns)
 
 
+def session_environment():
+    env = dict(os.environ)
+    session_id = env.setdefault("HUSKARL_SESSION_ID", "example-api-primary")
+    if not session_id.strip():
+        raise ValueError("HUSKARL_SESSION_ID must not be empty")
+    if "HUSKARL_STATE_DIR" not in env:
+        if session_id in (".", "..") or "/" in session_id:
+            raise ValueError("Use a simple HUSKARL_SESSION_ID without path separators, or set HUSKARL_STATE_DIR explicitly")
+        env["HUSKARL_STATE_DIR"] = str(
+            Path.home() / "Library/Application Support/HuskarlNativeSession" / session_id)
+    if not env["HUSKARL_STATE_DIR"].strip():
+        raise ValueError("HUSKARL_STATE_DIR must not be empty")
+    state_dir = Path(env["HUSKARL_STATE_DIR"]).expanduser().resolve()
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env["HUSKARL_STATE_DIR"] = str(state_dir)
+    return env
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-only", action="store_true")
@@ -67,10 +85,19 @@ def main():
         "-module-cache-path", str(WORK / "swift-cache"),
         str(ROOT / "target/debug/libhuskarl_native_session.a"),
         "-framework", "Security", "-framework", "CoreFoundation", "-framework", "Foundation",
-        "-framework", "AuthenticationServices", "-framework", "AppKit", "-o", str(binary), env=env)
+        "-framework", "AuthenticationServices", "-framework", "AppKit",
+        "-framework", "SwiftUI", "-o", str(binary), env=env)
+    resources = contents / "Resources"
+    resources.mkdir(parents=True, exist_ok=True)
+    iconset = WORK / "Huskarl.iconset"
+    run("xcrun", "swift", "-module-cache-path", str(WORK / "swift-cache"),
+        "examples/native-session/Icon.swift", str(iconset), env=env)
+    run("xcrun", "iconutil", "--convert", "icns", str(iconset),
+        "--output", str(resources / "Huskarl.icns"))
     (contents / "Info.plist").write_bytes(plistlib.dumps({
         "CFBundleIdentifier": bundle_id, "CFBundleExecutable": binary.name,
         "CFBundleName": "Huskarl Native Session", "CFBundlePackageType": "APPL",
+        "CFBundleIconFile": "Huskarl.icns",
         "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0",
         "LSMinimumSystemVersion": "14.0", "NSPrincipalClass": "NSApplication",
     }))
@@ -89,12 +116,15 @@ def main():
     if not args.build_only:
         # Run the bundle executable directly so the app receives this shell's
         # provider configuration. Launch Services does not inherit it reliably.
-        run(str(binary), env=dict(os.environ, HUSKARL_ACCESS_GROUP=group))
+        run(str(binary), env=dict(session_environment(), HUSKARL_ACCESS_GROUP=group))
 
 
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        sys.exit(130)
     except (subprocess.CalledProcessError, ValueError, KeyError, OSError) as error:
         print(f"Native session example: {error}", file=sys.stderr)
         sys.exit(1)

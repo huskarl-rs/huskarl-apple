@@ -23,6 +23,8 @@ jobs:
             args: "--features web-authentication"
           - name: local-authentication
             args: "--features local-authentication"
+          - name: session
+            args: "--features session"
           - name: all
             args: "--all-features"
     name: Rust ${{ matrix.rust }} / ${{ matrix.features.name }}

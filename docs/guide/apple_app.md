@@ -15,7 +15,7 @@ you use:
 crate-type = ["staticlib"]
 
 [dependencies]
-huskarl-apple = { version = "0.1", features = ["web-authentication", "urlsession"] }
+huskarl-apple = { version = "0.1", features = ["session", "urlsession"] }
 ```
 
 Add Huskarl and your executor dependencies as in the
@@ -26,8 +26,8 @@ into Swift. The example's
 shows the static library, bridging header, and Apple framework linkage for macOS.
 In an Xcode project, put the equivalent settings in the application target.
 
-Keep the grant, pending PKCE/state, token source/cache, Keychain store, and DPoP
-key in the Rust session owner. Expose operations and UI results rather than raw
+Use `AppleSession` to own the pending login, token source/cache, and credential
+lifecycle. Configure the grant, Keychain store and DPoP key before construction. Expose operations and UI results rather than raw
 tokens. Define ownership and lifetimes for every pointer crossing the bridge.
 
 ## Provide a main-thread execution boundary
@@ -43,11 +43,32 @@ The session future is not `Send`, so do not submit it to `tokio::spawn`. A Swift
 `Task` alone does not drive a Rust future: supply a Rust executor integrated with
 the UI event loop, or a bridge that schedules polls on the main thread.
 
-The macOS example demonstrates the latter. An AppKit timer polls once every
-50 ms, briefly entering a current-thread Tokio runtime and returning immediately
-when the future is pending. It never blocks the UI waiting for the whole login.
-Applications with an existing main-thread executor can use that integration.
-The adapters' async Keychain APIs already move blocking native work to workers.
+The application owns execution. `huskarl-apple` exposes the session driver as a
+future and does not supply an executor. Schedule the driver and UI operations on
+your application's main-thread executor and retain it until shutdown completes.
+
+The native-session example contains a private
+[executor helper](https://github.com/huskarl-rs/huskarl-apple/blob/main/examples/native-session/rust/src/executor.rs)
+that schedules ready futures through `dispatch2`. It demonstrates one integration
+with AppKit; it is example support, not a library API or required runtime.
+
+That helper drives local futures; it does not provide Tokio I/O or timers.
+If your grant/transport uses Tokio (including Huskarl retry delays), keep a Tokio
+runtime with background workers alive and enter its handle on **each poll**.
+The native example's `spawn` helper does this with `poll_fn`. Entering a runtime
+only when submitting a task is insufficient, and an idle current-thread runtime
+will not drive timers. Applications with an existing main-thread executor can
+continue using it instead.
+
+The native-session example uses completion callbacks to update Swift, with no
+polling timer. The driver remains scheduled even when no UI operation is active,
+so background `SessionAccess` requests can wake it independently.
+
+The adapters' async Keychain APIs already move blocking native work to workers. For background Rust services, obtain a
+`SessionAccess` on the main thread and move or clone it into the worker; it is
+`Send + Sync` and queues authorization work to the driver. Keep driving the
+main-thread session while workers await their results. See
+[background authorization](crate::_docs::guide::native_session#authorize-requests-from-background-rust-tasks).
 
 ## Expose operations and explicit UI states
 
@@ -58,15 +79,16 @@ form a concrete bridge contract:
 
 | Bridge call | Contract in this example |
 |---|---|
-| `huskarl_native_start(window, action, ephemeral)` | Main thread; live window; actions 0 restore, 1 login, 2 GET, 3 logout; busy task is not replaced |
-| `huskarl_native_poll()` | Main thread; 0 idle, 1 pending, 2 success, 3 failure |
+| `huskarl_native_start(window, action, ephemeral, completion)` | Main thread; live window; actions 0 restore, 1 login, 2 GET, 3 logout; busy task is not replaced |
 | `huskarl_native_status()` | Copy the returned C string immediately; valid only until the next bridge call; no credentials |
-| `huskarl_native_cancel()` | Cancel an active authentication browser |
-| `huskarl_native_shutdown()` | Drop application session state; normal example shutdown occurs with no pending operation |
+| `huskarl_native_cancel()` | Cancel the current login attempt through `AppleSession` |
+| `huskarl_native_shutdown(completion)` | Await shutdown and driver exit before reporting completion; normal example shutdown begins with no pending operation |
 
-Disable competing session operations while one is active. Publish separate
-restoring, signed-out, signing-in, ready, and failed states in your own UI, with
-explicit retry actions. Do not interpret every Keychain error as signed-out:
+The completion callback runs on the main thread with 2 for success or 3 for failure,
+and must remain callable until invoked. Invalid submissions may complete immediately.
+The example disables competing UI actions while busy. Other applications can
+use `snapshot()` or `subscribe()` to render the library session state, including
+`CleanupRequired` and `UnsavedChanges`, with explicit retry actions. Do not interpret every Keychain error as signed-out:
 locked or denied access needs a retry path that preserves credentials.
 
 ## Handle cancellation, closure, and local locking
@@ -76,13 +98,16 @@ ends. Preserve the session owner across transient SwiftUI view reconstruction;
 view disappearance must not accidentally create another token owner.
 
 Dropping a Keychain future does not cancel native work already running on a
-worker. Serialize logout and credential mutation against outstanding operations.
+worker. `AppleSession` serializes logout and credential mutation in its driver;
+keep that driver running until `shutdown()` completes.
 The example prevents window closure and app termination while an operation is
-pending. In a production app, define equivalent behavior for scene changes and
+pending. Once idle, it returns AppKit's `terminateLater`, awaits shutdown and
+driver exit, then replies to the termination request. Retain the executor until
+that drain finishes; dropping it cancels pending futures. In a production app, define equivalent behavior for scene changes and
 shutdown without assuming the operating system will wait for cleanup.
 
-For an application inactivity lock, gate requests and drop token sources, caches,
-and session memory. If using `local-authentication`, invalidate the context and
+For an application inactivity lock, await `AppleSession::lock()` to gate requests
+and discard token memory. This does not invalidate an externally supplied authentication context. If using `local-authentication`, invalidate the context and
 create a new one when rebuilding adapters. Context invalidation does not erase
 previously read tokens. Follow [authentication contexts](crate::_docs::guide::key_authentication)
 for item policies and native `LAContext` interop.

@@ -7,8 +7,9 @@
 //! | Application need | Adapter | Cargo feature |
 //! |---|---|---|
 //! | Present browser login | `web_authentication::WebAuthenticationSession` | `web-authentication` |
+//! | Own a native login/session lifecycle | `session::AppleSession` | `session` |
 //! | Persist refresh tokens | [`keychain::KeychainRefreshTokenStore`] | None |
-//! | Sign DPoP proofs with a hardware key | [`secure_enclave::Es256PrivateKey`] | None |
+//! | Sign `DPoP` proofs with a hardware key | [`secure_enclave::Es256PrivateKey`] | None |
 //! | Control local authentication | `authentication::AuthenticationContext` | `local-authentication` |
 //! | Use Apple networking and TLS client identities | `urlsession::UrlSessionClient` | `urlsession` |
 //! | Store other secrets or sign and seal data | [`keychain`] and [`secure_enclave`] | None |
@@ -36,7 +37,7 @@
 //! - **Solve a task:** [present browser login](crate::_docs::guide::browser_login),
 //!   [persist refresh tokens](crate::_docs::guide::refresh_tokens),
 //!   [use Apple networking and mTLS](crate::_docs::guide::native_networking),
-//!   [choose a DPoP key policy](crate::_docs::guide::dpop_policy), or
+//!   [choose a `DPoP` key policy](crate::_docs::guide::dpop_policy), or
 //!   [sign an app](crate::_docs::guide::signing_an_app).
 //! - **Understand:** [Apple and OAuth responsibilities](crate::_docs::explanation::apple_oauth),
 //!   [the security model](crate::_docs::explanation::security_model), and
@@ -68,6 +69,8 @@ pub mod keychain;
 mod platform;
 pub mod policy;
 pub mod secure_enclave;
+#[cfg(all(feature = "session", any(target_os = "macos", target_os = "ios")))]
+pub mod session;
 #[cfg(feature = "urlsession")]
 pub mod urlsession;
 #[cfg(all(

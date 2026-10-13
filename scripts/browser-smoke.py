@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import plistlib
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -110,11 +111,24 @@ def main():
                     raise RuntimeError(f"Cancellation sequence failed; inspect {log_path}")
                 print("Explicit cancel, drop, and restart checks passed.", flush=True)
         finally:
-            if app is not None and app.poll() is None:
-                app.terminate()
-                app.wait(timeout=10)
-            run("docker", "stop", "--time", "3", container, stdout=subprocess.DEVNULL)
+            try:
+                if app is not None and app.poll() is None:
+                    app.terminate()
+                    try:
+                        app.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        app.kill()
+                        app.wait()
+            finally:
+                run("docker", "stop", "--time", "3", container, stdout=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except (subprocess.SubprocessError, ValueError, RuntimeError, OSError) as error:
+        print(f"Browser smoke test: {error}", file=sys.stderr)
+        sys.exit(1)

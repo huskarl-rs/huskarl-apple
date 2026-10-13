@@ -1,6 +1,6 @@
 //! Main-thread C bridge for a complete macOS OAuth/DPoP session example.
 mod diagnostics;
-mod storage;
+mod executor;
 
 use std::{
     cell::{Cell, RefCell},
@@ -9,71 +9,73 @@ use std::{
     future::{Future, poll_fn},
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
-    pin::Pin,
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::Poll,
 };
 
 use bytes::Bytes;
 use diagnostics::{TracedClient, failure, milestone};
+use executor::MainThreadExecutor;
 use http::{Method, Request, StatusCode, Uri};
 use huskarl::{
-    authorizer::{HttpAuthorizer, dpop_resend_advised, parse_challenges},
-    cache::{
-        GrantTokenSource, InMemoryRefreshTokenStore, InMemoryTokenCache, NoSource, Recovery,
-        RefreshTokenStore, TokenSource,
-    },
+    authorizer::{dpop_resend_advised, parse_challenges},
+    cache::RefreshTokenStore,
     grant::authorization_code::{AuthorizationCodeGrant, StartInput},
 };
 use huskarl_apple::{
     Es256PrivateKey,
     keychain::{DataProtectionKeychain, KeychainRefreshTokenStore, SecretAccessPolicy},
     policy::Authentication,
+    session::{AppleSession, PersistenceState, SessionPhase, SignInOptions},
     urlsession::UrlSessionClient,
-    web_authentication::{PresentationAnchor, WebAuthenticationError, WebAuthenticationSession},
+    web_authentication::PresentationAnchor,
 };
 use huskarl_core::{
     OAuthErrorCode,
     client_auth::NoAuth,
-    crypto::signer::AsymmetricJwsSigner,
     dpop::DPoP,
     http::{HttpClient, Idempotency},
     server_metadata::AuthorizationServerMetadata,
 };
 use objc2::{MainThreadMarker, rc::Retained};
-use storage::SessionRefreshTokens;
-
-type Source =
-    GrantTokenSource<AuthorizationCodeGrant, SessionRefreshTokens<KeychainRefreshTokenStore>>;
-type Task = Pin<Box<dyn Future<Output = Result<String, String>>>>;
 
 thread_local! {
-    static TASK: RefCell<Option<Task>> = RefCell::new(None);
-    static BROWSER: RefCell<Option<WebAuthenticationSession>> = const { RefCell::new(None) };
-    static SESSION: RefCell<Option<Rc<Session>>> = const { RefCell::new(None) };
+    static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static CLOSING: Cell<bool> = const { Cell::new(false) };
+    static SESSION: RefCell<Option<Rc<AppState>>> = const { RefCell::new(None) };
     static STATUS: RefCell<CString> = RefCell::new(CString::new("Restoring session…").unwrap());
+    static EXECUTOR: MainThreadExecutor = MainThreadExecutor::new(
+        MainThreadMarker::new().expect("Executor requires the main thread"));
+    // The background runtime drives timers even while AppKit is idle. Local
+    // futures only enter its context; they are still polled on the main thread.
     static RUNTIME: Result<tokio::runtime::Runtime, std::io::Error> =
-        tokio::runtime::Builder::new_current_thread().enable_time().build();
+        tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_time().build();
 }
 
-struct Session {
-    grant: AuthorizationCodeGrant,
-    source: Arc<Source>,
-    cache: Arc<InMemoryTokenCache<Arc<Source>>>,
-    authorizer: HttpAuthorizer,
+fn spawn(future: impl Future<Output = ()> + 'static) -> Result<(), String> {
+    let handle = RUNTIME.with(|runtime| {
+        runtime
+            .as_ref()
+            .map(|runtime| runtime.handle().clone())
+            .map_err(|_| "Could not initialize the timer runtime.".to_owned())
+    })?;
+    let mut future = Box::pin(future);
+    EXECUTOR.with(|executor| {
+        executor.spawn_local(poll_fn(move |cx| {
+            let _entered = handle.enter();
+            future.as_mut().poll(cx)
+        }))
+    });
+    Ok(())
+}
+
+// Only application configuration, transport and presentation live here.
+// The library owns all token, browser and session lifecycle state.
+struct AppState {
+    controller: AppleSession,
+    driver_done: RefCell<Option<futures_channel::oneshot::Receiver<()>>>,
     client: TracedClient<UrlSessionClient>,
     resource: Uri,
     scopes: Vec<String>,
-    thumbprint: String,
-    authenticated: Cell<bool>,
-    cleanup_pending: Cell<bool>,
-    persistence_failed: Arc<AtomicBool>,
-    // Kept until all session operations/handles are gone, including shutdown.
-    _owner: File,
 }
 
 fn required(name: &str) -> Result<String, String> {
@@ -135,8 +137,8 @@ fn saved_storage(
     Ok((owner, disk))
 }
 
-impl Session {
-    async fn restore() -> Result<(Rc<Self>, String), String> {
+impl AppState {
+    async fn configure() -> Result<Rc<Self>, String> {
         let issuer = required("ISSUER")?;
         let resource = required("RESOURCE_URL")?;
         if !https(&issuer) || !https(&resource) {
@@ -160,30 +162,9 @@ impl Session {
             );
         }
         let (owner, disk) = saved_storage(&session_id, &group, &state_dir)?;
-        let restored = disk.get().await.map_err(|error| failure("Read saved refresh token", &error, "Could not restore Keychain credentials. Unlock or authorize access, then retry; credentials were preserved."))?;
         let key = Es256PrivateKey::load_or_generate()
             .label(&format!("io.huskarl.native-session/{session_id}"))
             .access_group(group).lock_path(&state_dir.join("key.lock")).load_or_generate().await.map_err(|error| failure("Load or create Secure Enclave key", &error, "Could not provision the Secure Enclave key. Check hardware, signing, access group, and unlock state."))?;
-        let thumbprint = key.public_key_jwk().thumbprint();
-        let memory = InMemoryRefreshTokenStore::default();
-        let mut authenticated = false;
-        let mut message = "No saved session. Sign in to continue.";
-        if let Some(token) = restored {
-            if token.dpop_jkt() == Some(thumbprint.as_str()) {
-                memory.set(&token).await.map_err(|error| {
-                    failure(
-                        "Restore session memory",
-                        &error,
-                        "Could not restore session memory.",
-                    )
-                })?;
-                authenticated = true;
-                message = "Session restored. Make a request to refresh the access token.";
-            } else {
-                disk.clear().await.map_err(|error| failure("Remove token with obsolete key binding", &error, "Saved session has a different key; could not remove its unusable token. Retry restore."))?;
-                message = "The saved key binding changed. Sign in again on this device.";
-            }
-        }
         milestone("Configuring native networking and discovering provider endpoints");
         let client = TracedClient::new(UrlSessionClient::builder().build().map_err(|error| {
             failure(
@@ -221,122 +202,74 @@ impl Session {
                     "Could not configure OAuth. Check redirect URI and provider capabilities.",
                 )
             })?;
-        let persistence_failed = Arc::new(AtomicBool::new(false));
-        let source = Arc::new(
-            GrantTokenSource::builder()
-                .grant(grant.clone())
-                .grant_parameters(NoSource)
-                .refresh_store(SessionRefreshTokens {
-                    disk,
-                    memory,
-                    persistence_failed: persistence_failed.clone(),
-                })
-                .build(),
-        );
-        let cache = Arc::new(InMemoryTokenCache::builder().source(source.clone()).build());
-        let authorizer = HttpAuthorizer::builder().cache(cache.clone()).build();
-        Ok((
-            Rc::new(Self {
-                grant,
-                source,
-                cache,
-                authorizer,
-                client,
-                resource: resource.parse().map_err(|error| {
-                    failure("Parse RESOURCE_URL", &error, "Invalid RESOURCE_URL.")
-                })?,
-                scopes,
-                thumbprint,
-                authenticated: Cell::new(authenticated),
-                cleanup_pending: Cell::new(false),
-                persistence_failed,
-                _owner: owner,
-            }),
-            message.into(),
-        ))
+        let resource = resource
+            .parse()
+            .map_err(|error| failure("Parse RESOURCE_URL", &error, "Invalid RESOURCE_URL."))?;
+        let (controller, driver) = AppleSession::builder()
+            .grant(grant)
+            .refresh_store(disk)
+            .main_thread(MainThreadMarker::new().ok_or("Main thread required")?)
+            .build();
+        let (finished, driver_done) = futures_channel::oneshot::channel();
+        spawn(async move {
+            // Keep exclusive persisted-session ownership until all work settles.
+            driver.run().await;
+            drop(owner);
+            let _ = finished.send(());
+        })?;
+        Ok(Rc::new(Self {
+            controller,
+            driver_done: RefCell::new(Some(driver_done)),
+            client,
+            resource,
+            scopes,
+        }))
+    }
+
+    async fn restore(&self) -> Result<String, String> {
+        let state = self.controller.restore().await.map_err(|error| failure(
+            "Restore session", &error,
+            "Retry after resolving access failures; for an obsolete key binding, Log out before signing in again.",
+        ))?;
+        Ok(if state.phase == SessionPhase::Ready {
+            "Session restored. Make a request to refresh the access token."
+        } else {
+            "No saved session. Sign in to continue."
+        }
+        .into())
     }
 
     async fn login(&self, window: &PresentationAnchor, ephemeral: bool) -> Result<String, String> {
-        if self.authenticated.get() || self.cleanup_pending.get() {
-            return Err("Complete logout before starting another sign-in.".into());
-        }
-        milestone("OAuth start: preparing authorization request");
-        let attempts = self.client.attempts();
-        let started = self
-            .grant
-            .start(StartInput::builder().scope(self.scopes.clone()).build())
+        self.controller
+            .sign_in(
+                window,
+                StartInput::builder().scope(self.scopes.clone()).build(),
+                SignInOptions {
+                    prefers_ephemeral: ephemeral,
+                    ..SignInOptions::default()
+                },
+            )
             .await
             .map_err(|error| {
-                let attempted = self.client.attempts() - attempts;
-                let recovery = if attempted == 0 {
-                    "No HTTP request was attempted during OAuth start. Fix the reported local configuration, serialization, or signing cause, then retry Sign in."
-                } else {
-                    "A pushed authorization request was attempted before browser presentation. Check the reported signing, transport, or provider rejection cause, then retry Sign in."
-                };
-                failure("Start OAuth", &error, recovery)
-            })?;
-        milestone("OAuth start completed; presenting authentication browser");
-        let browser = WebAuthenticationSession::start()
-            .authorization_url(&started.authorization_url.to_string())
-            .redirect_uri(&started.pending_state.redirect_uri)
-            .window(window)
-            .prefers_ephemeral(ephemeral)
-            .call()
-            .map_err(|error| {
                 failure(
-                    "Present authentication browser",
+                    "Sign in",
                     &error,
-                    "Could not present login. Check foreground window and redirect configuration.",
+                    "Resolve the reported cause and retry. If cleanup is required, retry Log out.",
                 )
             })?;
-        BROWSER.with(|slot| *slot.borrow_mut() = Some(browser));
-        let callback = poll_fn(|cx| {
-            BROWSER.with(|slot| {
-                slot.borrow_mut()
-                    .as_mut()
-                    .map_or(Poll::Ready(Err(WebAuthenticationError::Cancelled)), |b| {
-                        Pin::new(b).poll(cx)
-                    })
-            })
-        })
-        .await;
-        BROWSER.with(|slot| slot.borrow_mut().take());
-        let callback = callback.map_err(|e| {
-            match e {
-                WebAuthenticationError::Cancelled => "Sign-in cancelled. You can try again.",
-                _ => return failure("Receive browser callback", &e, "Check the reported presentation or callback mismatch cause and retry Sign in."),
+        Ok(
+            if self.controller.snapshot().persistence == PersistenceState::Saved {
+                "Signed in. Credentials saved; make an authenticated request."
+            } else {
+                "Signed in for this run. The provider did not issue a refresh token."
             }
-            .to_owned()
-        })?;
-        let completed = self.grant.complete(&started.pending_state,
-            callback.parse().map_err(|error| failure("Parse callback", &error, "Invalid callback."))?).await
-            .map_err(|error| failure("Complete authorization-code flow", &error, "OAuth completion failed: state, PKCE, provider response, or token exchange was rejected."))?;
-        let token = completed.token_response;
-        if token.access_token().dpop_jkt() != Some(self.thumbprint.as_str())
-            || token
-                .refresh_token()
-                .is_none_or(|t| t.dpop_jkt() != Some(self.thumbprint.as_str()))
-        {
-            return Err(
-                "Provider must issue a DPoP-bound access token and refresh token for this key."
-                    .into(),
-            );
-        }
-        self.source.prime(token).await.map_err(|error| {
-            failure(
-                "Persist new session",
-                &error,
-                "Could not persist sign-in. Authorize Keychain access and sign in again.",
-            )
-        })?;
-        self.cache.invalidate();
-        self.authenticated.set(true);
-        Ok("Signed in. Credentials saved; make an authenticated request.".into())
+            .into(),
+        )
     }
 
     async fn request(&self) -> Result<String, String> {
         let result = self.request_inner().await;
-        if !self.persistence_failed.load(Ordering::Relaxed) {
+        if self.controller.snapshot().persistence != PersistenceState::UnsavedChanges {
             return result;
         }
         // Report rotation persistence failure even if the subsequent API
@@ -350,18 +283,20 @@ impl Session {
     }
 
     async fn request_inner(&self) -> Result<String, String> {
-        if !self.authenticated.get() || self.cleanup_pending.get() {
-            return Err("Sign in before making a request.".into());
-        }
+        let access = self.controller.access().map_err(|error| {
+            failure("Access session", &error, "Sign in before making a request.")
+        })?;
         for attempt in 0..2 {
-            let headers = self.authorizer.get_headers(&Method::GET, &self.resource).await.map_err(|error| {
-                if error.recovery() == Recovery::Reauthenticate {
-                    self.authenticated.set(false);
-                    failure("Authorize API request", &error, "Session expired. Sign in again.")
-                } else {
-                    failure("Authorize API request", &error, "Credentials were preserved. Resolve the reported cause, then retry Make request.")
-                }
-            })?;
+            let headers = access
+                .get_headers(&Method::GET, &self.resource)
+                .await
+                .map_err(|error| {
+                    failure(
+                        "Authorize API request",
+                        &error,
+                        "Check session state and the reported recovery cause before retrying.",
+                    )
+                })?;
             if !headers.contains_key("dpop") {
                 return Err("Refusing to send a request without a DPoP proof.".into());
             }
@@ -376,8 +311,16 @@ impl Session {
                 .execute(request, Idempotency::Idempotent)
                 .await
                 .map_err(|error| failure("Send authenticated API request", &error, "API request failed. Credentials were preserved; check the network and retry."))?;
-            self.authorizer
-                .process_response(&self.resource, &response.headers);
+            access
+                .process_response(&self.resource, &response.headers)
+                .await
+                .map_err(|error| {
+                    failure(
+                        "Process API response",
+                        &error,
+                        "Session changed while requesting.",
+                    )
+                })?;
             let invalid_token = response.status == StatusCode::UNAUTHORIZED
                 && parse_challenges(&response.headers)
                     .iter()
@@ -404,11 +347,13 @@ impl Session {
     }
 
     async fn logout(&self) -> Result<String, String> {
-        // One UI task at a time means no request or rotation can race logout.
-        self.authenticated.set(false);
-        self.cleanup_pending.set(true);
-        self.cache.clear().await.map_err(|error| failure("Delete saved refresh token during logout", &error, "Logged out of memory, but Keychain cleanup failed. Retry Log out before quitting; a saved credential may remain."))?;
-        self.cleanup_pending.set(false);
+        self.controller.logout().await.map_err(|error| {
+            failure(
+                "Log out",
+                &error,
+                "Retry Log out to finish saved-credential cleanup.",
+            )
+        })?;
         Ok(
             "Logged out. Saved refresh token removed. Browser/provider cookies are unchanged."
                 .into(),
@@ -435,13 +380,16 @@ pub unsafe extern "C" fn huskarl_native_start(
     window: *mut PresentationAnchor,
     action: i32,
     ephemeral: i32,
+    completion: extern "C" fn(i32),
 ) {
     main_thread();
-    if TASK.with(|t| t.borrow().is_some()) {
+    if ACTIVE.get() || CLOSING.get() {
+        completion(3);
         return;
     }
     let Some(window) = (unsafe { Retained::retain(window) }) else {
         status("No presentation window.");
+        completion(3);
         return;
     };
     milestone(match action {
@@ -457,87 +405,144 @@ pub unsafe extern "C" fn huskarl_native_start(
         2 => "Making authenticated request…",
         _ => "Removing saved session…",
     });
-    TASK.with(|t| {
-        *t.borrow_mut() = Some(Box::pin(async move {
-            if action == 0 {
-                if SESSION.with(|s| s.borrow().is_some()) {
-                    return Err("Session already initialized.".into());
-                }
-                let (session, message) = Session::restore().await?;
-                SESSION.with(|s| *s.borrow_mut() = Some(session));
-                return Ok(message);
-            }
-            let session = SESSION.with(|s| s.borrow().clone());
-            if action == 3 && session.is_none() {
-                // Local cleanup remains possible when discovery or key loading
-                // failed. Take ownership without reading the token or networking.
-                let (owner, disk) = saved_storage(
-                    &required("HUSKARL_SESSION_ID")?,
-                    &required("HUSKARL_ACCESS_GROUP")?,
-                    &PathBuf::from(required("HUSKARL_STATE_DIR")?),
-                )?;
-                let result = disk.clear().await;
-                drop(owner);
-                result.map_err(|error| failure("Delete saved refresh token after initialization failure", &error, "Could not remove the saved token. Authorize Keychain access and retry Log out."))?;
-                return Ok("Saved refresh token removed. Retry restore before signing in.".into());
-            }
-            let session = session.ok_or("Restore the session first.")?;
-            match action {
-                1 => session.login(&window, ephemeral != 0).await,
-                2 => session.request().await,
-                3 => session.logout().await,
-                _ => Err("Unknown operation.".into()),
-            }
-        }))
-    });
-}
-
-/// Poll once and immediately return to AppKit; 1=pending, 2=success, 3=failure.
-#[unsafe(no_mangle)]
-pub extern "C" fn huskarl_native_poll() -> i32 {
-    main_thread();
-    TASK.with(|t| {
-        let mut task = t.borrow_mut();
-        let Some(future) = task.as_mut() else {
-            return 0;
-        };
-        let result = RUNTIME.with(|rt| match rt {
-            Ok(rt) => rt.block_on(poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))),
-            Err(_) => Poll::Ready(Err("Could not initialize the UI executor.".into())),
-        });
-        match result {
-            Poll::Pending => 1,
-            Poll::Ready(result) => {
-                task.take();
-                BROWSER.with(|b| b.borrow_mut().take());
-                let code = if result.is_ok() { 2 } else { 3 };
-                status(&result.unwrap_or_else(|e| e));
-                code
-            }
+    ACTIVE.set(true);
+    let operation = async move {
+        if action == 0 {
+            let existing = SESSION.with(|s| s.borrow().clone());
+            let session = if let Some(session) = existing {
+                session
+            } else {
+                let session = AppState::configure().await?;
+                SESSION.with(|s| *s.borrow_mut() = Some(session.clone()));
+                session
+            };
+            return session.restore().await;
         }
-    })
+        let session = SESSION.with(|s| s.borrow().clone());
+        if action == 3 && session.is_none() {
+            // Local cleanup remains possible when discovery or key loading
+            // failed. Take ownership without reading the token or networking.
+            let (owner, disk) = saved_storage(
+                &required("HUSKARL_SESSION_ID")?,
+                &required("HUSKARL_ACCESS_GROUP")?,
+                &PathBuf::from(required("HUSKARL_STATE_DIR")?),
+            )?;
+            let result = disk.clear().await;
+            drop(owner);
+            result.map_err(|error| failure("Delete saved refresh token after initialization failure", &error, "Could not remove the saved token. Authorize Keychain access and retry Log out."))?;
+            return Ok("Saved refresh token removed. Retry restore before signing in.".into());
+        }
+        let session = session.ok_or("Restore the session first.")?;
+        match action {
+            1 => session.login(&window, ephemeral != 0).await,
+            2 => session.request().await,
+            3 => session.logout().await,
+            _ => Err("Unknown operation.".into()),
+        }
+    };
+    if let Err(error) = spawn(async move {
+        let result = operation.await;
+        let code = if result.is_ok() { 2 } else { 3 };
+        status(&result.unwrap_or_else(|error| error));
+        ACTIVE.set(false);
+        completion(code);
+    }) {
+        ACTIVE.set(false);
+        status(&error);
+        completion(3);
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn huskarl_native_cancel() {
     main_thread();
-    BROWSER.with(|b| {
-        if let Some(browser) = b.borrow_mut().as_mut() {
-            browser.cancel();
+    SESSION.with(|s| {
+        if let Some(session) = s.borrow().as_ref() {
+            session.controller.cancel_sign_in();
         }
     });
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn huskarl_native_shutdown() {
+pub extern "C" fn huskarl_native_shutdown(completion: extern "C" fn(i32)) {
     main_thread();
-    TASK.with(|t| t.borrow_mut().take());
-    BROWSER.with(|b| b.borrow_mut().take());
-    SESSION.with(|s| s.borrow_mut().take());
+    // AppKit defers termination until this callback. Continue driving both the
+    // session and this task until the driver has released the storage lock.
+    if ACTIVE.get() || CLOSING.replace(true) {
+        completion(3);
+        return;
+    }
+    let session = SESSION.with(|s| s.borrow().clone());
+    if let Err(error) = spawn(async move {
+        let result = async {
+            if let Some(session) = session {
+                session
+                    .controller
+                    .shutdown()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let done = session.driver_done.borrow_mut().take();
+                if let Some(done) = done {
+                    done.await
+                        .map_err(|_| "Session driver stopped unexpectedly.".to_owned())?;
+                }
+            }
+            Ok::<_, String>(())
+        }
+        .await;
+        if let Err(error) = &result {
+            status(error);
+            CLOSING.set(false);
+        } else {
+            SESSION.with(|s| s.borrow_mut().take());
+        }
+        completion(if result.is_ok() { 2 } else { 3 });
+    }) {
+        CLOSING.set(false);
+        status(&error);
+        completion(3);
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn huskarl_native_status() -> *const c_char {
     main_thread();
     STATUS.with(|s| s.borrow().as_ptr())
+}
+
+/// Credential-free presentation state for the example UI.
+#[repr(C)]
+pub struct HuskarlSessionState {
+    phase: i32,
+    persistence: i32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn huskarl_native_state() -> HuskarlSessionState {
+    main_thread();
+    SESSION.with(|session| {
+        let session = session.borrow();
+        let Some(session) = session.as_ref() else {
+            return HuskarlSessionState {
+                phase: 0,
+                persistence: 0,
+            };
+        };
+        let state = session.controller.snapshot();
+        HuskarlSessionState {
+            phase: match state.phase {
+                SessionPhase::SignedOut | SessionPhase::ReauthenticationRequired => 1,
+                SessionPhase::Ready => 2,
+                SessionPhase::CleanupRequired => 3,
+                SessionPhase::Locked | SessionPhase::Closed => 4,
+                _ => 5,
+            },
+            persistence: match state.persistence {
+                PersistenceState::Absent => 1,
+                PersistenceState::Saved => 2,
+                PersistenceState::UnsavedChanges => 3,
+                _ => 0,
+            },
+        }
+    })
 }

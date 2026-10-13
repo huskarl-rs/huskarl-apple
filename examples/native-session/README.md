@@ -7,10 +7,10 @@ For adapting the bridge to your application, see
 The [first-login tutorial](../../docs/tutorial/first_login.md) provides a smaller
 starting point without provisioning assets.
 
-A signed AppKit application with a Rust session owner:
+A signed AppKit application with a SwiftUI interface using the library’s `AppleSession` controller:
 
 ```text
-ASWebAuthenticationSession → authorization code + PKCE/state validation
+AppleSession → ASWebAuthenticationSession + authorization code + PKCE/state validation
                                          ↓
 Secure Enclave DPoP key ←→ Keychain refresh token + key binding
                                          ↓
@@ -22,6 +22,17 @@ The app restores credentials at launch, offers **Sign in**, **Make request**,
 On the next launch, its first API request refreshes the saved token. Tokens,
 authorization codes, and response bodies stay inside Rust; the UI receives only
 status text and response sizes.
+
+The session card shows the controller's credential-free state and Keychain
+persistence status. Its primary action changes from **Sign in** to **Make
+request** when credentials are ready. **Session options** keeps restore and
+credential cleanup available after failures. Expand **Activity** for the last
+30 completed operations in this launch. The interface supports light and dark
+appearance, reduced motion, and selectable status text; its icon is rendered
+from vector artwork during the build. No third-party UI packages are required.
+With Xcode 26+ and macOS 26+, the action buttons and header badge use Liquid
+Glass. Older SDKs and systems retain native bordered controls, as does the
+Reduce Transparency accessibility setting.
 
 ## Requirements and provider setup
 
@@ -51,10 +62,6 @@ export CLIENT_ID='your-public-client'
 export REDIRECT_URI='io.huskarl.native-session:/oauth/callback'
 export RESOURCE_URL='https://api.example.com/v1/profile'
 export SCOPE='read offline_access'
-export HUSKARL_SESSION_ID='example-api-primary'
-export HUSKARL_STATE_DIR="$HOME/Library/Application Support/HuskarlNativeSession/$HUSKARL_SESSION_ID"
-mkdir -p "$HUSKARL_STATE_DIR"
-chmod 700 "$HUSKARL_STATE_DIR"
 mise run example:native-session
 ```
 
@@ -66,8 +73,9 @@ configure. The native browser adapter does not support `http://localhost` or
 `REDIRECT_URI` to that URI and register the identical value with the provider.
 
 Replace the scopes with your provider's API scopes. `offline_access` alone does
-not guarantee a refresh token. The app requires both access and refresh tokens
-to be DPoP-bound to its enclave key and refuses requests without a DPoP proof.
+not guarantee a refresh token. The configured grant uses DPoP; the controller validates token/key bindings and
+the example refuses requests without a DPoP proof. If no refresh token is issued,
+the session works for this run but cannot be restored after restart.
 If your provider requires resource indicators, add those to `StartInput` and the
 grant's refresh configuration as described in Huskarl's authorization-code guide.
 
@@ -78,7 +86,16 @@ The script validates the profile, builds and signs the app, verifies its signatu
 then runs its bundle executable with your shell's configuration. Keep that terminal
 open. Relaunch with the same command and configuration to restore the session.
 
-### Choose a local session name
+### Optional local session settings
+
+The launcher defaults `HUSKARL_SESSION_ID` to `example-api-primary` and
+`HUSKARL_STATE_DIR` to
+`~/Library/Application Support/HuskarlNativeSession/<session-id>`.
+It creates the session directory with private permissions if it does not exist.
+Neither variable needs to be set for the usual single-session demo. Both can be
+overridden; changing only the session ID also selects its corresponding default
+directory. These defaults are supplied by the launcher, so direct executable
+launches still need both variables.
 
 `HUSKARL_SESSION_ID` names a **local saved-session slot**. Choose a stable label
 for the session you want to save and restore. Internally, the example maps it to
@@ -97,7 +114,7 @@ or simultaneous user sessions, such as `example-api-primary` and
 `example-api-secondary`. This example manages one slot per app process. To replace
 the user in an existing slot, complete **Log out** before signing in again.
 All processes using the same slot must use the same state directory so they
-share the refresh-token ownership lock. The path above incorporates the label;
+share the refresh-token ownership lock. The default path incorporates the label;
 use a simple label without path separators.
 
 For a signed build without launching:
@@ -135,8 +152,8 @@ Secure Enclave or entitled Keychain operations. The app is generated under
 Keychain access failure. Once initialized, use the other controls. An expired
 refresh token leads to an explicit sign-in action rather than an automatic
 browser loop. A definitively lost/replaced device key invalidates its old token
-binding; the app removes that unusable token and asks for a new sign-in. Locked
-or denied key access does not count as key loss and does not erase credentials.
+binding; the controller preserves the token and requires **Log out** before a
+new sign-in. Locked or denied key access does not count as key loss and does not erase credentials.
 **Log out** also removes saved credentials after initialization fails, without
 requiring provider discovery or access to the enclave key. It still takes the
 session ownership lock and requires permission to delete the Keychain item.
@@ -148,14 +165,22 @@ also prevents multiple app instances from rotating the same saved token. Every
 process using this token item must use the same state directory and ownership
 protocol. Keep both lock files on disk; replacing one can split lock ownership.
 
-AppKit's timer polls the Rust future once every 50 ms on the main thread, entering
-a current-thread Tokio runtime only for that single poll. It immediately returns
-to the UI event loop rather than blocking on completion. Browser creation,
-polling, cancellation, and destruction all remain on the main thread. Keychain
-operations and key provisioning use the adapter's blocking pool through async APIs.
-The app rejects closing/quitting while an operation is pending. Browser login
-can be cancelled; dropping a pending Keychain operation would not cancel a
-native operation already in progress.
+The example-local `MainThreadExecutor` helper schedules the library driver and operation futures on the
+main dispatch queue when they wake. Completion callbacks update AppKit; there
+is no polling timer, and background authorization requests can wake the driver
+while the UI is idle. Browser creation, polling, cancellation, and destruction
+stay on the main thread. Keychain operations run on blocking workers. This helper
+is private application support; `huskarl-apple` does not expose an executor.
+
+The Rust `spawn` helper enters a background Tokio runtime on each local poll so
+retry timers keep working while the native event loop runs. It never waits for
+an operation to finish on the UI thread.
+
+The app refuses window closure and termination while an operation is active.
+Once idle, termination is deferred with `terminateLater` until session shutdown
+and driver exit complete and release the storage ownership lock. The completion
+callback then replies to AppKit's termination request. Force quit and system
+termination cannot guarantee this drain.
 
 ## Protection and recovery
 
@@ -185,8 +210,9 @@ with new headers. Redirects are disabled and response buffering is bounded by
 URLSession's default 1 MiB limit. Use the final API URL. Do not generalize the GET
 retry to writes without an API idempotency contract.
 
-For an application inactivity lock, also drop its source/cache/session state and
-gate operations. Locking Keychain does not revoke secrets already in memory.
+The library also exposes `lock()` and revocable `SessionAccess` handles for an
+application inactivity lock. Locking Keychain alone does not revoke secrets
+already in memory. The example does not implement an inactivity timer.
 
 ## Automated checks
 
@@ -196,7 +222,10 @@ cargo clippy --locked --manifest-path examples/native-session/rust/Cargo.toml --
 python3 scripts/native-session.py --build-only --unsigned
 ```
 
-Unit tests exercise rotation persistence failure and failed logout cleanup.
+Library session tests exercise rotation persistence failure, logout/write races,
+login cancellation, failed cleanup, stale handles, binding checks and state changes.
+Run them with `cargo test --features session --lib session::`. The example no
+longer carries its own persistence adapter or lifecycle implementation.
 Compilation checks the Rust/Swift bridge and native app. Full browser login,
 restart persistence, authenticated API access, and logout require the configured
 provider and signed hardware app; perform the lifecycle walkthrough above.

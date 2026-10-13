@@ -11,12 +11,22 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-huskarl-apple = { path = "../../..", features = ["web-authentication", "urlsession"] }
+huskarl-apple = { path = "../../..", features = ["session", "urlsession"] }
 huskarl = { version = "0.11", default-features = false }
 huskarl-core = { version = "0.10", default-features = false }
 bytes = "1"
+futures-channel = "0.3"
+futures-util = "0.3"
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 http = "1"
 objc2 = "0.6"
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 url = "2"
+
+[dev-dependencies]
+core-foundation = "0.10"
+
+[[test]]
+name = "main_thread_executor"
+harness = false

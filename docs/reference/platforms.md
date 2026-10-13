@@ -6,7 +6,7 @@ listed below. This crate does not document support for tvOS, watchOS, or visionO
 
 ## Cargo features
 
-The three optional integrations are opt-in; Keychain and Secure Enclave APIs do
+The optional integrations are opt-in; Keychain and Secure Enclave APIs do
 not require a feature flag.
 
 | API | Cargo feature | Runtime prerequisites |
@@ -16,6 +16,7 @@ not require a feature flag.
 | `secure_enclave` | None | Supported physical hardware and access to the data protection Keychain |
 | `authentication::AuthenticationContext` | `local-authentication` | Protection policy on the item; Face ID usage description on iOS when using Face ID |
 | `web_authentication::WebAuthenticationSession` | `web-authentication` | macOS 10.15+ or iOS 13+; main thread, running UI loop, and presentation window |
+| `session::AppleSession` | `session` (includes `web-authentication`) | Main-thread driver; configured authorization-code grant and dedicated refresh store |
 | HTTPS browser callback | `web-authentication` | macOS 14.4+ or iOS 17.4+; associated-domain configuration |
 | `urlsession::UrlSessionClient` | `urlsession` | Apple networking; TLS client identity optional |
 
@@ -23,7 +24,7 @@ For all optional integrations:
 
 ```toml
 [dependencies]
-huskarl-apple = { version = "0.1", features = ["web-authentication", "urlsession", "local-authentication"] }
+huskarl-apple = { version = "0.1", features = ["session", "urlsession", "local-authentication"] }
 ```
 
 The crate is a Rust library. Swift applications supply a bridge; the examples
@@ -71,6 +72,6 @@ On macOS, build all optional modules from this checkout with:
 cargo doc --all-features --no-deps --open
 ```
 
-The published docs.rs configuration also enables all three integrations. Default
+The published docs.rs configuration also enables all optional integrations. Default
 feature builds omit their API modules. The [API reference](https://docs.rs/huskarl-apple/latest/huskarl_apple/)
 documents individual types, builders, errors, and methods.
